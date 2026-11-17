@@ -29,11 +29,22 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
+class EmbeddingModelError(RuntimeError):
+    """The embedding model couldn't be loaded: usually no internet on the first run."""
+
+
 class FastEmbedEmbedder:
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5") -> None:
         from fastembed import TextEmbedding
 
-        self._model = TextEmbedding(model_name)
+        try:
+            self._model = TextEmbedding(model_name)
+        except ValueError as e:  # fastembed: "Could not load model ... from any source."
+            raise EmbeddingModelError(
+                f"Couldn't load the embedding model {model_name}: {e} The first run downloads "
+                "it, so it needs an internet connection. To work offline, set "
+                "RAG_EMBEDDER=hashing."
+            ) from e
         self.dim = len(self.embed_query("probe"))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:

@@ -31,3 +31,11 @@ def test_env_variables_are_read(monkeypatch):
     assert settings.anthropic_api_key is not None
     assert settings.anthropic_api_key.get_secret_value() == "sk-secret"
     assert "sk-secret" not in repr(settings)  # SecretStr keeps it out of logs
+
+
+def test_tests_do_not_read_a_developers_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("RAG_TOP_K=42\n")
+    monkeypatch.chdir(tmp_path)
+    assert Settings().top_k == 5  # conftest.py turns automatic .env loading off
+    assert Settings(_env_file=env_file).top_k == 42  # reading .env itself still works

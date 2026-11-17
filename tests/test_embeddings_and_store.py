@@ -12,6 +12,13 @@ def test_hashing_embedder_is_normalised_and_ignores_stopwords():
     assert emb.embed_query("the what of") == [0.0] * 64  # only stopwords: empty vector
 
 
+def test_hashing_embedder_matches_words_in_any_script():
+    embedder = HashingEmbedder()
+    query = embedder.embed_query("база данных")  # "database"
+    [doc] = embedder.embed_documents(["Векторная база данных хранит эмбеддинги."])
+    assert sum(q * d for q, d in zip(query, doc, strict=True)) > 0.5
+
+
 def test_hashing_embedder_rejects_bad_dim():
     with pytest.raises(ValueError, match="dim"):
         HashingEmbedder(dim=0)

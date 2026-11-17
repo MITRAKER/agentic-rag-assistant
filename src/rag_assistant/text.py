@@ -11,7 +11,8 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 # or a common abbreviation at the end of the text so far ("e.g.").
 _LIST_MARKER = re.compile(r"(\d+|[A-Za-z])[.)]")
 _ABBREVIATION = re.compile(r"(e\.g|i\.e|etc|vs|dr|mr|mrs|ms|fig|no)\.", re.IGNORECASE)
-_WORD = re.compile(r"[a-z0-9]+")
+# Letters and digits in any script ("café", "данные", "2024"); underscores split words.
+_WORD = re.compile(r"[^\W_]+")
 
 STOPWORDS = frozenset(
     {

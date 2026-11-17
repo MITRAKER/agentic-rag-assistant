@@ -1,4 +1,6 @@
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import anthropic
 import pytest
@@ -17,7 +19,8 @@ def offline_env(monkeypatch, tmp_path):
     monkeypatch.setenv("RAG_QDRANT_PATH", str(tmp_path / "qdrant"))
     monkeypatch.setenv("RAG_EMBEDDER", "hashing")
     monkeypatch.setenv("RAG_LLM", "extractive")
-    monkeypatch.chdir(tmp_path)  # so a developer's own .env file is not picked up
+    monkeypatch.setenv("HOME", str(tmp_path))  # no `ant auth login` profile from the real home
+    monkeypatch.chdir(tmp_path)
 
 
 def test_ingest_ask_search_stats(offline_env):
@@ -40,15 +43,33 @@ def test_ingest_ask_search_stats(offline_env):
     assert "chunk(s)" in result.output
 
 
-def test_ask_without_api_key_explains_what_to_do(offline_env, monkeypatch, tmp_path):
-    monkeypatch.setenv("RAG_LLM", "claude")
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+def test_ask_without_api_key_explains_what_to_do(offline_env, monkeypatch):
+    monkeypatch.setenv("RAG_LLM", "claude")  # conftest.py removed every ANTHROPIC_* variable
     result = runner.invoke(app, ["ask", "anything"])
     assert result.exit_code == 1
     assert "ANTHROPIC_API_KEY" in result.output
+
+
+def test_ask_explains_broken_credential_settings(offline_env, monkeypatch, tmp_path):
+    monkeypatch.setenv("RAG_LLM", "claude")
+    monkeypatch.setenv("ANTHROPIC_CONFIG_DIR", str(tmp_path / "empty"))  # no profile in it
+    result = runner.invoke(app, ["ask", "anything"])
+    assert result.exit_code == 1
+    assert "Couldn't load your Anthropic credentials" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_explains_an_embedding_model_that_cannot_be_downloaded(offline_env, monkeypatch):
+    def offline(model_name):
+        raise ValueError(f"Could not load model {model_name} from any source.")
+
+    # A stand-in for the fastembed package, so the test needs no download either.
+    monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=offline))
+    monkeypatch.setenv("RAG_EMBEDDER", "fastembed")
+    result = runner.invoke(app, ["stats"])
+    assert result.exit_code == 1
+    assert "Couldn't load the embedding model" in result.output
+    assert "RAG_EMBEDDER=hashing" in result.output
 
 
 def test_invalid_setting_is_named_without_a_traceback(offline_env, monkeypatch):
@@ -80,8 +101,14 @@ class FakeResponse:
         self.headers: dict[str, str] = {}
 
 
-def status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
-    return cls("boom", response=FakeResponse(status), body=None)
+def status_error(
+    cls: type[anthropic.APIStatusError], status: int, body: object = None
+) -> anthropic.APIStatusError:
+    return cls("boom", response=FakeResponse(status), body=body)
+
+
+# What the API sends when it is overloaded, here in the middle of a stream (HTTP 200).
+OVERLOADED = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
 
 
 @pytest.mark.parametrize(
@@ -91,8 +118,12 @@ def status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.
         (status_error(anthropic.PermissionDeniedError, 403), "permission denied"),
         (status_error(anthropic.NotFoundError, 404), "Check RAG_LLM_MODEL"),
         (status_error(anthropic.RateLimitError, 429), "Rate limited"),
+        (anthropic.APITimeoutError(request=object()), "took too long"),
         (anthropic.APIConnectionError(request=object()), "Couldn't reach"),
-        (status_error(anthropic.InternalServerError, 500), "Anthropic API error 500: boom"),
+        (anthropic.CredentialsError("no profile"), "credentials: no profile"),
+        (status_error(anthropic.InternalServerError, 500), "Anthropic API error: boom (HTTP 500)"),
+        (status_error(anthropic.APIStatusError, 200, OVERLOADED), "overloaded_error: Overloaded"),
+        (anthropic.AnthropicError("odd"), "Anthropic SDK error: odd"),
     ],
 )
 def test_ask_explains_api_errors(offline_env, monkeypatch, error, message):

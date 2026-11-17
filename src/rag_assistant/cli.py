@@ -18,11 +18,12 @@ from pydantic import ValidationError
 
 from rag_assistant.answering import Answer, answer_question, get_answerer
 from rag_assistant.config import Settings, get_settings
-from rag_assistant.embeddings import get_embedder
+from rag_assistant.embeddings import EmbeddingModelError, get_embedder
 from rag_assistant.ingestion import IngestionError, ingest_path
 from rag_assistant.vectorstore import VectorStore, make_client
 
 if TYPE_CHECKING:
+    import anthropic
     from pydantic_core import ErrorDetails
 
 app = typer.Typer(help="Agentic RAG knowledge assistant", no_args_is_help=True)
@@ -47,9 +48,13 @@ def _describe(error: ErrorDetails) -> str:
 
 @contextmanager
 def _open_store(settings: Settings) -> Iterator[VectorStore]:
+    try:
+        embedder = get_embedder(settings)
+    except EmbeddingModelError as e:  # e.g. no internet for the first download
+        _fail(str(e))
     client = make_client(settings)
     try:
-        yield VectorStore(client, settings.collection, get_embedder(settings))
+        yield VectorStore(client, settings.collection, embedder)
     finally:
         client.close()  # embedded Qdrant locks its folder until the client closes
 
@@ -89,7 +94,7 @@ def ask(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show model, tokens and sources"),
 ) -> None:
     """Answer QUESTION from your documents, with citations."""
-    import anthropic
+    import anthropic  # imported here, not at the top: it takes most of a second to load
 
     from rag_assistant.answering.claude import MissingCredentialsError
 
@@ -102,20 +107,58 @@ def ask(
             )
     except MissingCredentialsError as e:
         _fail(str(e))
-    except anthropic.AuthenticationError:
-        _fail("Anthropic rejected the API key. Check ANTHROPIC_API_KEY.")
-    except anthropic.PermissionDeniedError:
-        _fail(f"This API key can't use the model '{settings.llm_model}' (permission denied).")
-    except anthropic.NotFoundError:
-        _fail(f"Model '{settings.llm_model}' was not found. Check RAG_LLM_MODEL.")
-    except anthropic.RateLimitError:
-        _fail("Rate limited by the Anthropic API. Wait a moment and try again.")
-    except anthropic.APIConnectionError:
-        _fail("Couldn't reach the Anthropic API. Check your internet connection.")
-    except anthropic.APIStatusError as e:
-        _fail(f"Anthropic API error {e.status_code}: {e.message}")
+    except anthropic.AnthropicError as e:
+        _fail(_explain_api_error(e, settings.llm_model))
 
     _print_answer(answer, verbose)
+
+
+def _explain_api_error(error: Exception, model: str) -> str:
+    """A short, actionable message for an error raised by the Anthropic SDK."""
+    import anthropic
+
+    # Most specific first, because the first matching class wins: for example,
+    # APITimeoutError is a kind of APIConnectionError.
+    messages: list[tuple[type[Exception], str]] = [
+        (anthropic.AuthenticationError, "Anthropic rejected the API key. Check ANTHROPIC_API_KEY."),
+        (
+            anthropic.PermissionDeniedError,
+            "This API key can't use the model '{model}' (permission denied).",
+        ),
+        (anthropic.NotFoundError, "Model '{model}' was not found. Check RAG_LLM_MODEL."),
+        (
+            anthropic.RateLimitError,
+            "Rate limited by the Anthropic API. Wait a moment and try again.",
+        ),
+        (
+            anthropic.APITimeoutError,
+            "The Anthropic API took too long to answer. Try again in a moment.",
+        ),
+        (
+            anthropic.APIConnectionError,
+            "Couldn't reach the Anthropic API. Check your internet connection.",
+        ),
+        (anthropic.CredentialsError, "Couldn't load your Anthropic credentials: {error}"),
+    ]
+    for kind, message in messages:
+        if isinstance(error, kind):
+            return message.format(model=model, error=error)
+    if isinstance(error, anthropic.APIStatusError):
+        return f"Anthropic API error: {_status_error_detail(error)}"
+    return f"Anthropic SDK error: {error}"
+
+
+def _status_error_detail(error: anthropic.APIStatusError) -> str:
+    """'overloaded_error: Overloaded', from the error body the API sends.
+
+    An error can also arrive in the middle of a streamed answer, after the
+    HTTP status 200 was sent, so the status code alone can mislead.
+    """
+    body = error.body if isinstance(error.body, dict) else {}
+    detail = body.get("error")
+    if isinstance(detail, dict) and "message" in detail:
+        return f"{detail.get('type', 'error')}: {detail['message']}"
+    return f"{error.message} (HTTP {error.status_code})"
 
 
 def _fail(message: str) -> NoReturn:

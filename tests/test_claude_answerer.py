@@ -1,6 +1,10 @@
+import json
+
+import anthropic
+import httpx2
 import pytest
 
-from fakes import FakeClient, cited_text, message
+from fakes import FakeClient, cited_text, iteration, message
 from rag_assistant.answering import Source
 from rag_assistant.answering.claude import FALLBACK_BETA, ClaudeAnswerer, search_result_block
 
@@ -108,6 +112,104 @@ def test_detects_fallback_model():
     assert answer.fallback_from == "claude-opus-5-5"
     assert answer.model == "claude-opus-4-8"
     assert answer.text == "Answer."
+
+
+def test_detects_a_sticky_fallback_without_a_fallback_block():
+    """After a fallback, the API sends the same conversation straight to the fallback
+    model for a while. Nothing declines, so there is no fallback block; the usage
+    entry of type "fallback_message" is the signal."""
+    response = message(
+        [{"type": "text", "text": "Answer."}],
+        model="claude-opus-4-8",
+        iterations=[iteration("fallback_message", "claude-opus-4-8")],
+    )
+    answer = ClaudeAnswerer(FakeClient(response)).answer("q", SOURCES)
+    assert answer.fallback_from == "claude-opus-5-5"  # the model we asked for
+    assert answer.model == "claude-opus-4-8"
+
+
+def test_no_fallback_reported_when_the_requested_model_answered():
+    response = message(
+        [{"type": "text", "text": "Answer."}],
+        iterations=[iteration("message", "claude-opus-5-5")],
+    )
+    assert ClaudeAnswerer(FakeClient(response)).answer("q", SOURCES).fallback_from is None
+
+
+def sse(*events: dict) -> str:
+    """Server-sent events, the format the Messages API streams in."""
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
+CITATION = {
+    "type": "search_result_location",
+    "cited_text": "Qdrant uses HNSW.",
+    "source": "docs/vector.md",
+    "title": "Vector Databases",
+    "search_result_index": 0,
+    "start_block_index": 0,
+    "end_block_index": 1,
+}
+STREAM = sse(
+    {
+        "type": "message_start",
+        "message": {
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1200, "output_tokens": 1},
+        },
+    },
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "citations_delta", "citation": CITATION},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "Qdrant uses an HNSW index."},
+    },
+    {"type": "content_block_stop", "index": 0},
+    {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 42},
+    },
+    {"type": "message_stop"},
+)
+
+
+def test_streams_through_the_real_sdk_with_a_large_max_tokens():
+    """The real SDK, still offline: a mock transport plays the API's side.
+
+    Without streaming, the SDK refuses any max_tokens above 21,333 before sending
+    anything, so this also checks the top of RAG_LLM_MAX_TOKENS's range.
+    """
+    sent: list[httpx2.Request] = []
+
+    def fake_api(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, text=STREAM)
+
+    http = httpx2.Client(transport=httpx2.MockTransport(fake_api))
+    with anthropic.Anthropic(api_key="sk-test", http_client=http, max_retries=0) as client:
+        answer = ClaudeAnswerer(client, max_tokens=128_000).answer("What does Qdrant use?", SOURCES)
+
+    [request] = sent
+    body = json.loads(request.content)
+    assert body["stream"] is True
+    assert body["max_tokens"] == 128_000
+    assert body["fallbacks"] == "default"
+    assert FALLBACK_BETA in request.headers["anthropic-beta"]
+    assert answer.render() == "Qdrant uses an HNSW index. [1]"
+    assert answer.segments[0].citations[0].cited_text == "Qdrant uses HNSW."
+    assert (answer.input_tokens, answer.output_tokens) == (1200, 42)
 
 
 def test_max_tokens_marks_answer_truncated():

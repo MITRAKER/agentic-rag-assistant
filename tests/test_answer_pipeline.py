@@ -59,9 +59,7 @@ def test_missing_credentials_gives_a_clear_error(monkeypatch, tmp_path):
 
     from rag_assistant.answering.claude import MissingCredentialsError, make_client
 
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))  # no `ant auth login` profile either
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    # conftest.py removed every ANTHROPIC_* variable; this hides any `ant auth login` profile.
+    monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(MissingCredentialsError, match="RAG_LLM=extractive"):
         make_client()

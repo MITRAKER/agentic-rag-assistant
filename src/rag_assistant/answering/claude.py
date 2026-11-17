@@ -112,7 +112,8 @@ class ClaudeAnswerer:
             "max_tokens": self.max_tokens,
             "system": SYSTEM_PROMPT,
             # Effort controls how much the model thinks before answering.
-            # Claude Opus 5.5 always thinks adaptively; effort is the dial.
+            # Claude Opus 5.5's adaptive thinking can't be turned off, so effort
+            # is the dial; at low effort it may skip thinking on easy questions.
             "output_config": {"effort": self.effort},
             "messages": [
                 {
@@ -132,11 +133,18 @@ class ClaudeAnswerer:
     def answer(self, question: str, sources: list[Source]) -> Answer:
         if not sources:
             raise ValueError("ClaudeAnswerer needs at least one source to cite")
-        response = self.client.beta.messages.create(**self.build_request(question, sources))
-        return parse_response(response, question, sources)
+        # We stream even though we only use the finished message. Without a
+        # stream, the SDK refuses any request whose max_tokens could take more
+        # than ten minutes to generate (above 21,333 tokens), because an idle
+        # connection can be dropped on the way. A stream keeps it busy.
+        with self.client.beta.messages.stream(**self.build_request(question, sources)) as stream:
+            response = stream.get_final_message()
+        return parse_response(response, question, sources, requested_model=self.model)
 
 
-def parse_response(response: BetaMessage, question: str, sources: list[Source]) -> Answer:
+def parse_response(
+    response: BetaMessage, question: str, sources: list[Source], requested_model: str | None = None
+) -> Answer:
     """Convert an API response into our own Answer type."""
     from anthropic.types.beta import (
         BetaCitationSearchResultLocation,
@@ -159,7 +167,8 @@ def parse_response(response: BetaMessage, question: str, sources: list[Source]) 
     for block in response.content:
         if isinstance(block, BetaFallbackBlock):
             # The requested model declined; a fallback model wrote what follows.
-            answer.fallback_from = block.from_.model
+            # If several models declined in turn, the first block names ours.
+            answer.fallback_from = answer.fallback_from or block.from_.model
         elif isinstance(block, BetaTextBlock):
             citations = [
                 Citation(source_index=c.search_result_index, cited_text=c.cited_text)
@@ -169,7 +178,21 @@ def parse_response(response: BetaMessage, question: str, sources: list[Source]) 
             ]
             answer.segments.append(Segment(block.text, citations))
         # Other block types (e.g. "thinking") aren't part of the visible answer.
+    if answer.fallback_from is None and _served_by_fallback(response):
+        # "Sticky routing": for about an hour after a conversation falls back,
+        # the API sends it straight to the fallback model. Nothing declined
+        # this time, so there is no fallback block, only the usage entry.
+        answer.fallback_from = requested_model or "the requested model"
     return answer
+
+
+def _served_by_fallback(response: BetaMessage) -> bool:
+    """The documented signal that a fallback model wrote the response.
+
+    `usage.iterations` lists every attempt; the one that produced the returned
+    message has the type "fallback_message" when it ran on a fallback model.
+    """
+    return any(item.type == "fallback_message" for item in response.usage.iterations or [])
 
 
 def _refused(answer: Answer, response: BetaMessage) -> Answer:
