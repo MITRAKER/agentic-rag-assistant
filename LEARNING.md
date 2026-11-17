@@ -337,24 +337,42 @@ in the order they're first cited.
 ### Concept 4: Calling Claude well
 
 * **Model:** `claude-opus-5-5` by default, configurable with `RAG_LLM_MODEL`.
-* **Effort:** Claude Opus 5.5 always thinks before answering. The
-  `output_config.effort` setting (`low`, `medium`, `high`, `xhigh`, `max`)
-  controls how much. We set `medium` explicitly. Short grounded answers rarely
-  need more; questions that combine facts from several documents may.
-* **`max_tokens`** is a hard cap on the reply. If it's hit, `stop_reason` is
-  `"max_tokens"`, the answer stops mid-sentence, and the CLI warns you.
+* **Effort:** Claude Opus 5.5 thinks *adaptively*: it decides how much to
+  think before answering, and thinking can't be turned off. The
+  `output_config.effort` setting (`low`, `medium`, `high`, `xhigh`, `max`) is
+  the dial; at `low` it may skip thinking on easy questions. We set `medium`
+  (the model's default) explicitly. Short grounded answers rarely need more;
+  questions that combine facts from several documents may.
+* **`max_tokens`** is a hard cap on the reply, thinking included. If it's hit,
+  `stop_reason` is `"max_tokens"`, the answer stops mid-sentence, and the CLI
+  warns you.
+* **Streaming:** we call `client.beta.messages.stream(...)` and then
+  `get_final_message()`, even though the CLI only prints the finished answer.
+  Without a stream, the SDK refuses any request whose `max_tokens` could take
+  more than ten minutes to generate (above 21,333 tokens), because a
+  connection that stays silent that long can be cut somewhere along the way.
+  A stream sends events while the model works, so `RAG_LLM_MAX_TOKENS` can use
+  the model's full 128,000.
 * **Stop reasons** tell you why the model stopped: `end_turn` (finished
   normally), `max_tokens` (cut off), `refusal` (a safety system declined the
   request). A refusal is a normal HTTP 200 response, so code must check for
   it; we drop any partial text and show the explanation.
 * **Fallbacks:** with `fallbacks="default"` (a beta feature), if the model
   declines, the API retries on a fallback model Anthropic recommends, inside the
-  same call. The response's `model` field says which model answered, and the
-  CLI tells you when that happened. Turn it off with `RAG_LLM_FALLBACKS=false`.
-* **Errors:** the CLI catches the SDK's error types from most to least
-  specific (bad key, rate limit, network, other API errors) so each gets a
-  helpful message. The SDK already retries rate limits and server errors twice
-  with back-off.
+  same call. The response's `model` field says which model answered. To know
+  that a fallback answered, a `fallback` content block marks the switch, but
+  the reliable signal is `usage.iterations`, the list of attempts: the one that
+  answered is marked `fallback_message`. After a fallback, the API sends the
+  same conversation straight to the fallback model for about an hour (*sticky
+  routing*), and those responses have no block. The CLI tells you when a
+  fallback answered. Turn it off with `RAG_LLM_FALLBACKS=false`.
+* **Errors:** the CLI turns each of the SDK's error types into one helpful
+  line, checking the most specific first (bad key, rate limit, timeout,
+  network, other API errors): a timeout is a kind of connection error, so it
+  must come first. With streaming, an error can even arrive after the HTTP
+  status `200 OK`, in the middle of the stream, so the message comes from the
+  error's body, not the status code. The SDK already retries rate limits,
+  server errors and dropped connections twice with back-off.
 * **Secrets:** the key comes from the environment or a git-ignored `.env`
   file, never the code. In `Settings` it's a `SecretStr`, which prints as
   `**********` if it ever ends up in a log.
@@ -389,6 +407,13 @@ answers vary. Instead we test two contracts:
    the SDK's own `BetaMessage` type, so a misspelled field fails in the test,
    not in production. Tests cover citations, refusals, fallbacks and
    `max_tokens`.
+
+Fakes skip the SDK itself, so one more test runs the **real SDK, still
+offline**: the `anthropic.Anthropic` client gets a *mock transport*, a small
+function that plays the API's side and answers with a stream of events. The SDK
+builds and sends a real request and assembles a real stream, but nothing leaves
+your machine. That test caught a bug the fakes couldn't (see "What a final
+review found" in the engineering standards).
 
 The real API is checked by hand now, and systematically in step 5's evaluation.
 
@@ -695,6 +720,41 @@ The new tests also found two real bugs:
    sentence was longer than the overlap budget, step 2's fix fell back to a
    word boundary. Step 2, concept 7 describes the corrected rule.
 
+### Concept 6: What a final review found
+
+Before the hand-over, the whole repository got one more review, by running
+experiments rather than only reading. Every check was green, and it still
+found five problems:
+
+1. **A valid setting crashed the program.** `Settings` accepted
+   `RAG_LLM_MAX_TOKENS` up to 128,000, the model's limit, but without
+   streaming the SDK refuses anything above 21,333 (step 2, concept 4). The
+   fakes in `tests/fakes.py` skip the SDK, so no test noticed. The fix is
+   streaming, and a new test sends 128,000 through the real SDK.
+2. **Some fallbacks went unreported.** The code looked only for the
+   `fallback` block, which sticky-routed responses don't have. It now also
+   reads `usage.iterations`, the signal the API documents.
+3. **Non-English words disappeared.** The extractive answerer has split words
+   with `[a-z0-9]+` since step 2. When the embedder fix above reused that
+   helper, the offline embedder lost non-English words too: "данные" vanished,
+   and "café" became "caf". The sample documents are all in English, so no
+   test noticed. Words are now `[^\W_]+` (letters and digits in any script),
+   with tests in Russian and French.
+4. **The tests depended on the developer's machine.** A `.env` file (which
+   CONTRIBUTING.md tells you to create) or exported `RAG_*` and `ANTHROPIC_*`
+   variables changed what the tests ran against, for example pointing them at
+   a Qdrant server. An `autouse` fixture in `tests/conftest.py` now gives every
+   test a clean slate. Tests that give the same result on every machine are
+   called *hermetic*.
+5. **Three failures still printed tracebacks:** broken credential settings
+   (`ANTHROPIC_PROFILE` or `ANTHROPIC_CONFIG_DIR` pointing at nothing), the
+   first download of the embedding model without internet, and API timeouts.
+   Each now prints one line that says what to do.
+
+**Lesson:** green checks prove what the tests check, nothing more. A review
+that *tries* things (the largest value of each setting, text in another
+language, a developer's `.env`) finds what nobody thought to test.
+
 ### Exercises
 
 1. **Break a rule on purpose.** Add a recursive function to
@@ -721,7 +781,12 @@ The new tests also found two real bugs:
 7. **Ship a release.** Once the pull requests are merged, follow "Releases" in
    CONTRIBUTING.md to publish v0.2.0, and look at the release page the
    workflow creates.
-8. **Interview questions to practise:** *"What's the difference between CI and
+8. **Review by experiment.** Pick a setting in `src/rag_assistant/config.py`,
+   run `rag ask` with its smallest and largest allowed values, and write down
+   what happens. Then, with `RAG_EMBEDDER=hashing`, ingest a short note in
+   another language, search it in that language, and look at the scores
+   `rag search` prints.
+9. **Interview questions to practise:** *"What's the difference between CI and
    CD?"*, *"What do SAST and SCA mean, and which tools here do which?"* and
    *"Tell me about a coding standard you've applied."* The Power of Ten table
    is a strong answer to the last one.

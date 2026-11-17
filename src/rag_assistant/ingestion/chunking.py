@@ -12,9 +12,10 @@ Strategy ("recursive character splitting"):
      then sentences, then words.
   2. Greedily pack the small pieces back together up to `chunk_size`.
   3. Start each new chunk with the last whole sentence(s) of the previous one,
-     up to `overlap` characters, so context that straddles a boundary still
-     appears whole somewhere. (Overlap snaps to sentence boundaries, or to
-     word boundaries when there are none, so chunks never start mid-sentence.)
+     about `overlap` characters' worth, so context that straddles a boundary
+     still appears whole somewhere. (Overlap snaps to sentence boundaries, so
+     one long last sentence can make it longer; text without sentence ends
+     falls back to line, then word boundaries. Chunks never start mid-sentence.)
 """
 
 from __future__ import annotations

@@ -20,10 +20,15 @@ newer (Python 3.10 reached end of life in October 2026).
   `rag stats`).
 - Answers with citations from Claude (`rag ask`), using native `search_result`
   blocks so every quote is copied from your documents. Refusals, truncated
-  answers and model fallbacks are reported. An offline extractive answerer
-  works without an API key (`RAG_LLM=extractive`).
+  answers and model fallbacks (sticky-routed ones included) are reported.
+  Requests are streamed, so `RAG_LLM_MAX_TOKENS` can go up to 128,000. An
+  offline extractive answerer works without an API key (`RAG_LLM=extractive`).
 - Settings are validated when the program starts (for example
-  `RAG_TOP_K=0` is rejected with a clear message).
+  `RAG_TOP_K=0` is rejected with a clear message). API errors and timeouts,
+  broken credential settings and a failed embedding-model download are each
+  explained in one line instead of a traceback.
+- The offline hashing embedder and the extractive answerer match words in any
+  script, not only English letters.
 - Ingestion limits: at most 10,000 files per run and 100 MB per file.
 - CI on every pull request: ruff, mypy (strict), the NASA/JPL Power of Ten
   checks, tests on Python 3.11 to 3.14 with at least 90% branch coverage,
