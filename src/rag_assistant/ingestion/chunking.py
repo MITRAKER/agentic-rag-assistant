@@ -23,16 +23,16 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
-from rag_assistant.ingestion.loaders import Document
+from rag_assistant.ingestion.loaders import Document, Metadata
 
-SEPARATORS = ["\n\n", "\n", ". ", " "]
+SEPARATORS = ("\n\n", "\n", ". ", " ")
 # Places where an overlap may start, best first: after a sentence end or a blank
 # line, then after any line break, then after any whitespace (between words).
-_BOUNDARIES = [
+_BOUNDARIES = (
     re.compile(r"(?<=[.!?])\s+|\n\s*\n"),
     re.compile(r"\n"),
     re.compile(r"\s+"),
-]
+)
 
 
 @dataclass
@@ -40,7 +40,7 @@ class Chunk:
     text: str
     source: str
     chunk_index: int
-    metadata: dict = field(default_factory=dict)
+    metadata: Metadata = field(default_factory=dict)
 
     @property
     def id(self) -> str:
@@ -53,34 +53,45 @@ class Chunk:
         return hashlib.sha256(key.encode()).hexdigest()
 
 
-def _split(text: str, chunk_size: int, separators: list[str]) -> list[str]:
-    """Break text into pieces no longer than chunk_size, preferring big boundaries."""
-    if len(text) <= chunk_size:
-        return [text]
-    if not separators:  # no boundary left: hard cut
-        return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+def _split(text: str, chunk_size: int) -> list[str]:
+    """Break text into pieces no longer than chunk_size, preferring big boundaries.
 
-    sep, rest = separators[0], separators[1:]
-    if sep not in text:
-        return _split(text, chunk_size, rest)
-
+    Written as a loop over an explicit stack rather than as a recursive
+    function (Power of Ten rule 1), with a provable bound on the number of
+    steps (rule 2): each step handles one fragment, and each separator level
+    can create at most len(text) + 1 fragments.
+    """
     pieces: list[str] = []
-    parts = text.split(sep)
-    for i, part in enumerate(parts):
-        # keep the separator attached so we can rebuild the text faithfully
-        piece = part + sep if i < len(parts) - 1 else part
-        if len(piece) <= chunk_size:
-            pieces.append(piece)
+    stack: list[tuple[str, int]] = [(text, 0)]  # (fragment, index of next separator to try)
+    max_steps = (len(text) + 1) * (len(SEPARATORS) + 1) + 1
+    for _ in range(max_steps):
+        if not stack:
+            return pieces
+        fragment, level = stack.pop()
+        if len(fragment) <= chunk_size:
+            pieces.append(fragment)
+        elif level == len(SEPARATORS):  # no boundary left: hard cut
+            pieces.extend(fragment[i : i + chunk_size] for i in range(0, len(fragment), chunk_size))
         else:
-            pieces.extend(_split(piece, chunk_size, rest))
-    return pieces
+            parts = _split_keeping_separator(fragment, SEPARATORS[level])
+            # push in reverse so the first part is processed (and emitted) first
+            stack.extend((part, level + 1) for part in reversed(parts))
+    raise RuntimeError("chunking did not finish within its step bound")  # unreachable in practice
+
+
+def _split_keeping_separator(text: str, sep: str) -> list[str]:
+    """'a. b. c' split on '. ' -> ['a. ', 'b. ', 'c'], so joining gives the text back."""
+    parts = text.split(sep)
+    return [part + sep for part in parts[:-1]] + [parts[-1]]
 
 
 def split_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str]:
-    if overlap >= chunk_size:
-        raise ValueError("overlap must be smaller than chunk_size")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
+    if not 0 <= overlap < chunk_size:
+        raise ValueError("overlap must be at least 0 and smaller than chunk_size")
 
-    pieces = _split(text, chunk_size, SEPARATORS)
+    pieces = _split(text, chunk_size)
     chunks: list[str] = []
     current = ""
     for piece in pieces:
@@ -88,7 +99,7 @@ def split_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
             chunks.append(current)
             # carry the tail of the previous chunk forward as overlap,
             # limited so the next chunk still has room for `piece`
-            current = _overlap_tail(current, min(overlap, chunk_size - len(piece)))
+            current = _overlap_tail(current, overlap, room=chunk_size - len(piece))
         current += piece
     if current:
         chunks.append(current)
@@ -96,19 +107,27 @@ def split_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
     return [c.strip() for c in chunks if c.strip()]
 
 
-def _overlap_tail(chunk: str, limit: int) -> str:
-    """The longest tail of `chunk` (at most `limit` chars) that starts at a clean boundary.
+def _overlap_tail(chunk: str, overlap: int, room: int) -> str:
+    """The text to repeat at the start of the next chunk.
 
-    A raw `chunk[-limit:]` usually starts mid-word or mid-sentence, and those
-    fragments later show up in search results and citations. So we prefer a
-    tail made of whole sentences, and fall back to whole words.
+    A raw `chunk[-overlap:]` usually starts mid-word or mid-sentence, and those
+    fragments later show up in search results and citations. Instead we take
+    the last whole sentences that fit in `overlap` characters. If even the last
+    sentence is longer, we take that one sentence when it fits in `room` (the
+    space left in the next chunk), and otherwise no overlap at all. Text with
+    no sentence boundaries falls back to line breaks, then word breaks.
     """
-    if limit <= 0:
+    if overlap <= 0:
         return ""
     for boundary in _BOUNDARIES:
-        starts = [m.end() for m in boundary.finditer(chunk) if len(chunk) - m.end() <= limit]
-        if starts and starts[0] < len(chunk):
-            return chunk[starts[0] :]
+        ends = [m.end() for m in boundary.finditer(chunk)]
+        if not ends:
+            continue  # no boundary of this kind: try the next, finer kind
+        # Possible starts: the chunk's own start (always clean) and every boundary inside it.
+        starts = [0] + [e for e in ends if e < len(chunk)]
+        fitting = [s for s in starts if len(chunk) - s <= overlap]
+        start = fitting[0] if fitting else starts[-1]
+        return chunk[start:] if len(chunk) - start <= room else ""
     return ""
 
 

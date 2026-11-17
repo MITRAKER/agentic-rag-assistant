@@ -11,6 +11,25 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 # or a common abbreviation at the end of the text so far ("e.g.").
 _LIST_MARKER = re.compile(r"(\d+|[A-Za-z])[.)]")
 _ABBREVIATION = re.compile(r"(e\.g|i\.e|etc|vs|dr|mr|mrs|ms|fig|no)\.", re.IGNORECASE)
+_WORD = re.compile(r"[a-z0-9]+")
+
+STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
+        "how", "i", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "this",
+        "to", "was", "what", "when", "where", "which", "who", "why", "with", "you", "your",
+    }
+)  # fmt: skip
+
+
+def content_words(text: str) -> list[str]:
+    """Lower-cased words of `text` without stopwords ("the", "what", ...), in order."""
+    return [w for w in _WORD.findall(text.lower()) if w not in STOPWORDS]
+
+
+def keywords(text: str) -> set[str]:
+    """The distinct content words of `text`."""
+    return set(content_words(text))
 
 
 def split_sentences(text: str) -> list[str]:

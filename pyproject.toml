@@ -1,37 +1,166 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # 1.27 added PEP 639 license metadata
 build-backend = "hatchling.build"
 
 [project]
 name = "rag-assistant"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Agentic RAG knowledge assistant: grounded answers with citations over your own documents."
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+license-files = ["LICENSE"]
+authors = [{ name = "Mitra Kermanian" }]
+requires-python = ">=3.11"  # 3.10 reached end of life in October 2026
+keywords = ["rag", "retrieval-augmented-generation", "llm", "claude", "qdrant", "ai-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
-    "qdrant-client>=1.9",
-    "fastembed>=0.3",
-    "pypdf>=4.0",
-    "beautifulsoup4>=4.12",
-    "pydantic-settings>=2.0",
-    "typer>=0.12",
     "anthropic>=2.9",
+    "beautifulsoup4>=4.12",
+    "fastembed>=0.3",
+    "pydantic-settings>=2.0",
+    "pypdf>=4.0",
+    "qdrant-client>=1.9",
+    "typer>=0.12",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.5"]
+# Development tools are pinned to exact versions so every machine and CI run
+# checks the code the same way. Dependabot opens PRs to update them.
+dev = [
+    "bandit[toml]==1.9.4",
+    "build==1.6.1",
+    "mypy==2.4.1",
+    "pip-audit==2.10.1",
+    "pre-commit==4.7.0",
+    "pre-commit-hooks==6.0.0",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/MITRAKER/agentic-rag-assistant"
+Issues = "https://github.com/MITRAKER/agentic-rag-assistant/issues"
+Changelog = "https://github.com/MITRAKER/agentic-rag-assistant/blob/main/CHANGELOG.md"
 
 [project.scripts]
 rag = "rag_assistant.cli:app"
 
+[tool.hatch.version]
+path = "src/rag_assistant/__init__.py"  # single source of truth for the version
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/rag_assistant"]
 
+# ---------------------------------------------------------------- tests ----
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "tools"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+# Power of Ten rule 10: zero warnings. Any warning raised during the tests fails them.
+# The single exception is a known leak inside qdrant-client's embedded mode: it opens a
+# temporary in-memory sqlite connection with `with sqlite3.connect(...)`, which does
+# not close it (qdrant_client/local/persistence.py). Remove the line once fixed upstream.
+filterwarnings = [
+    "error",
+    "ignore:unclosed database in <sqlite3.Connection:ResourceWarning",
+]
+
+[tool.coverage.run]
+source = ["rag_assistant"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+]
+
+# ----------------------------------------------------------------- lint ----
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+target-version = "py311"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle errors and warnings
+    "F",        # pyflakes: undefined names, unused imports and variables
+    "I",        # import sorting
+    "N",        # naming conventions
+    "UP",       # modern Python syntax
+    "B",        # bugbear: likely bugs and design problems
+    "S",        # bandit: security issues
+    "BLE",      # no blind `except Exception`
+    "A",        # don't shadow builtins
+    "C4",       # comprehension style
+    "C90",      # cyclomatic complexity (Power of Ten rules 1 and 4)
+    "PL",       # pylint: too many branches/statements/arguments, global statements
+    "PIE",      # misc. lints
+    "PT",       # pytest style
+    "RET",      # return statement consistency
+    "SIM",      # simplifications
+    "ARG",      # unused arguments
+    "ERA",      # commented-out code
+    "T20",      # no print() in library code
+    "TID",      # tidy imports
+    "PTH",      # pathlib over os.path
+    "RUF",      # ruff-specific rules
+]
+ignore = [
+    "PLC0415",  # imports inside functions: used on purpose to load heavy or optional libraries lazily
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 6
+max-branches = 12
+max-returns = 6
+max-statements = 40
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",     # assert is how pytest checks things
+    "PLR2004",  # magic numbers are fine in test expectations
+    "ARG",      # fixtures are often requested only for their side effects
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+# ---------------------------------------------------------------- types ----
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tools"]
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["fastembed", "fastembed.*"]
+ignore_missing_imports = true  # fastembed ships no type information
+
+# ------------------------------------------------------------- security ----
+
+[tool.bandit]
+exclude_dirs = ["tests"]

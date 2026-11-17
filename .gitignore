@@ -10,3 +10,9 @@ dist/
 build/
 # local Qdrant storage created by `rag ingest`
 qdrant_data/
+# test and tool output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/

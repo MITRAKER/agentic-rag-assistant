@@ -1,3 +1,5 @@
+import pytest
+
 from fakes import FakeClient, cited_text, message
 from rag_assistant.answering import Source
 from rag_assistant.answering.claude import FALLBACK_BETA, ClaudeAnswerer, search_result_block
@@ -67,7 +69,8 @@ def test_parses_citations_into_segments():
     assert answer.segments[0].citations[0].cited_text == "Qdrant uses HNSW."
     assert answer.model == "claude-opus-5-5"
     assert (answer.input_tokens, answer.output_tokens) == (1200, 80)
-    assert not answer.refused and not answer.truncated
+    assert not answer.refused
+    assert not answer.truncated
 
 
 def test_ignores_citations_to_unknown_results():
@@ -110,3 +113,11 @@ def test_detects_fallback_model():
 def test_max_tokens_marks_answer_truncated():
     response = message([{"type": "text", "text": "Cut"}], stop_reason="max_tokens")
     assert ClaudeAnswerer(FakeClient(response)).answer("q", SOURCES).truncated
+
+
+def test_rejects_empty_sources_and_bad_max_tokens():
+    client = FakeClient(message([{"type": "text", "text": "ok"}]))
+    with pytest.raises(ValueError, match="at least one source"):
+        ClaudeAnswerer(client).answer("q", [])
+    with pytest.raises(ValueError, match="max_tokens"):
+        ClaudeAnswerer(client, max_tokens=0)

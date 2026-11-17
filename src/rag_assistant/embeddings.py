@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
-from typing import Protocol
+from typing import Protocol, cast
 
 from rag_assistant.config import Settings
+from rag_assistant.text import content_words
 
 
 class Embedder(Protocol):
@@ -30,32 +30,41 @@ class Embedder(Protocol):
 
 
 class FastEmbedEmbedder:
-    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5") -> None:
         from fastembed import TextEmbedding
 
         self._model = TextEmbedding(model_name)
-        self.dim = len(next(iter(self._model.embed(["probe"]))))
+        self.dim = len(self.embed_query("probe"))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [v.tolist() for v in self._model.passage_embed(texts)]
+        # fastembed returns numpy arrays; Qdrant wants plain lists of floats.
+        return [cast("list[float]", v.tolist()) for v in self._model.passage_embed(texts)]
 
     def embed_query(self, text: str) -> list[float]:
         # bge models are trained with a different prefix for queries vs passages;
         # fastembed's query_embed adds it for us.
-        return next(iter(self._model.query_embed(text))).tolist()
+        return cast("list[float]", next(iter(self._model.query_embed(text))).tolist())
 
 
 class HashingEmbedder:
-    """Feature hashing: each word bumps one of `dim` buckets. L2-normalised."""
+    """Feature hashing: each content word adds 1 to one of `dim` buckets; L2-normalised.
 
-    def __init__(self, dim: int = 384):
+    Two texts score high when they share words. Stopwords ("the", "what") are
+    skipped because every text shares them. Different words can land in the
+    same bucket ("collisions"), which adds a little noise but never hides a match.
+    """
+
+    def __init__(self, dim: int = 384) -> None:
+        if dim < 1:
+            raise ValueError("dim must be at least 1")
         self.dim = dim
 
     def _embed(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
-        for word in re.findall(r"\w+", text.lower()):
-            h = int(hashlib.md5(word.encode()).hexdigest(), 16)
-            vec[h % self.dim] += 1.0 if (h >> 64) & 1 else -1.0
+        for word in content_words(text):
+            # blake2b is used as a fast, well-spread hash here, not for security.
+            digest = hashlib.blake2b(word.encode(), digest_size=8).digest()
+            vec[int.from_bytes(digest, "big") % self.dim] += 1.0
         norm = math.sqrt(sum(v * v for v in vec)) or 1.0
         return [v / norm for v in vec]
 

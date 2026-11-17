@@ -20,6 +20,7 @@ from qdrant_client import QdrantClient, models
 from rag_assistant.config import Settings
 from rag_assistant.embeddings import Embedder
 from rag_assistant.ingestion.chunking import Chunk
+from rag_assistant.ingestion.loaders import Metadata
 
 
 @dataclass
@@ -27,7 +28,7 @@ class SearchHit:
     text: str
     source: str
     score: float
-    metadata: dict
+    metadata: Metadata
 
 
 def make_client(settings: Settings) -> QdrantClient:
@@ -75,6 +76,8 @@ class VectorStore:
         )
 
     def upsert(self, chunks: list[Chunk], batch_size: int = 64) -> int:
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
         self.ensure_collection()
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
@@ -91,7 +94,7 @@ class VectorStore:
                         **c.metadata,
                     },
                 )
-                for c, vec in zip(batch, vectors)
+                for c, vec in zip(batch, vectors, strict=True)
             ]
             self.client.upsert(self.collection, points=points)
         return len(chunks)
@@ -103,6 +106,8 @@ class VectorStore:
         neighbour search always returns *something*, even for a question your
         documents know nothing about, so a threshold is a cheap first filter.
         """
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1")
         if not self.client.collection_exists(self.collection):
             return []
         result = self.client.query_points(

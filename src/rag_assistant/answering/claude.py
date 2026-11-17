@@ -16,10 +16,14 @@ the model could invent a quote or a source number; here that can't happen.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rag_assistant.answering.types import Answer, Citation, Segment, Source
 from rag_assistant.text import split_sentences
+
+if TYPE_CHECKING:
+    from anthropic import Anthropic
+    from anthropic.types.beta import BetaMessage, BetaSearchResultBlockParam
 
 SYSTEM_PROMPT = """\
 You answer questions using the search results in the user's message. They are \
@@ -46,8 +50,8 @@ class MissingCredentialsError(RuntimeError):
     """Raised when no Anthropic API key (or other credential) can be found."""
 
 
-def make_client(api_key: str | None = None) -> Any:
-    """Create an Anthropic client, failing early with a clear message if there are no credentials."""
+def make_client(api_key: str | None = None) -> Anthropic:
+    """Create an Anthropic client; fail early, with a clear message, if there are no credentials."""
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
@@ -64,7 +68,7 @@ def make_client(api_key: str | None = None) -> Any:
     return client
 
 
-def search_result_block(src: Source) -> dict:
+def search_result_block(src: Source) -> BetaSearchResultBlockParam:
     """Turn one retrieved chunk into a `search_result` content block.
 
     One text block per sentence gives finer citations: Claude cites whole
@@ -87,19 +91,21 @@ def search_result_block(src: Source) -> dict:
 class ClaudeAnswerer:
     def __init__(
         self,
-        client: Any,
+        client: Anthropic,
         model: str = "claude-opus-5-5",
         effort: str = "medium",
         max_tokens: int = 16000,
         fallbacks: bool = True,
-    ):
+    ) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
         self.client = client
         self.model = model
         self.effort = effort
         self.max_tokens = max_tokens
         self.fallbacks = fallbacks
 
-    def build_request(self, question: str, sources: list[Source]) -> dict:
+    def build_request(self, question: str, sources: list[Source]) -> dict[str, Any]:
         """The exact keyword arguments sent to the Messages API (handy for tests and debugging)."""
         request: dict[str, Any] = {
             "model": self.model,
@@ -124,44 +130,52 @@ class ClaudeAnswerer:
         return request
 
     def answer(self, question: str, sources: list[Source]) -> Answer:
+        if not sources:
+            raise ValueError("ClaudeAnswerer needs at least one source to cite")
         response = self.client.beta.messages.create(**self.build_request(question, sources))
         return parse_response(response, question, sources)
 
 
-def parse_response(response: Any, question: str, sources: list[Source]) -> Answer:
+def parse_response(response: BetaMessage, question: str, sources: list[Source]) -> Answer:
     """Convert an API response into our own Answer type."""
-    usage = getattr(response, "usage", None)
+    from anthropic.types.beta import (
+        BetaCitationSearchResultLocation,
+        BetaFallbackBlock,
+        BetaTextBlock,
+    )
+
     answer = Answer(
         question=question,
         segments=[],
         sources=sources,
         model=response.model,
         stop_reason=response.stop_reason,
-        input_tokens=getattr(usage, "input_tokens", 0) or 0,
-        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
     )
-
     if response.stop_reason == "refusal":
-        # A refusal is a normal HTTP 200 response. Any partial text is
-        # incomplete, so we drop it and explain instead.
-        details = getattr(response, "stop_details", None)
-        reason = getattr(details, "explanation", None)
-        message = "The model declined to answer this question."
-        answer.refused = True
-        answer.segments = [Segment(f"{message} {reason}" if reason else message)]
-        return answer
+        return _refused(answer, response)
 
     for block in response.content:
-        if block.type == "fallback":
+        if isinstance(block, BetaFallbackBlock):
             # The requested model declined; a fallback model wrote what follows.
             answer.fallback_from = block.from_.model
-        elif block.type == "text":
+        elif isinstance(block, BetaTextBlock):
             citations = [
                 Citation(source_index=c.search_result_index, cited_text=c.cited_text)
-                for c in (block.citations or [])
-                if c.type == "search_result_location" and 0 <= c.search_result_index < len(sources)
+                for c in block.citations or []
+                if isinstance(c, BetaCitationSearchResultLocation)
+                and 0 <= c.search_result_index < len(sources)
             ]
             answer.segments.append(Segment(block.text, citations))
         # Other block types (e.g. "thinking") aren't part of the visible answer.
+    return answer
 
+
+def _refused(answer: Answer, response: BetaMessage) -> Answer:
+    """A refusal is a normal HTTP 200 response. Any partial text is incomplete, so drop it."""
+    reason = response.stop_details.explanation if response.stop_details else None
+    message = "The model declined to answer this question."
+    answer.refused = True
+    answer.segments = [Segment(f"{message} {reason}" if reason else message)]
     return answer
