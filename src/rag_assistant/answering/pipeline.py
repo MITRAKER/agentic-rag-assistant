@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from rag_assistant.answering.types import Answer, Answerer, Segment, Source
 
 if TYPE_CHECKING:
     from rag_assistant.config import Settings
-    from rag_assistant.vectorstore import VectorStore
 
 NO_RESULTS = (
     "I couldn't find anything relevant in your documents. "
@@ -16,20 +16,11 @@ NO_RESULTS = (
 )
 
 
-def retrieve(
-    question: str, store: VectorStore, top_k: int = 5, min_score: float = 0.0
-) -> list[Source]:
-    return [Source.from_hit(h) for h in store.search(question, top_k=top_k, min_score=min_score)]
-
-
 def answer_question(
-    question: str,
-    store: VectorStore,
-    answerer: Answerer,
-    top_k: int = 5,
-    min_score: float = 0.0,
+    question: str, retrieve: Callable[[str], list[Source]], answerer: Answerer
 ) -> Answer:
-    sources = retrieve(question, store, top_k, min_score)
+    """Find evidence with `retrieve` (usually a retrieval.Retriever), then answer from it."""
+    sources = retrieve(question)
     if not sources:
         # Nothing to ground an answer in: say so instead of letting a model guess.
         # This also skips a paid API call.

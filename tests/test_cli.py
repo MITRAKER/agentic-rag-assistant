@@ -139,7 +139,7 @@ def test_ask_explains_api_errors(offline_env, monkeypatch, error, message):
 
 
 def test_ask_warns_about_cut_off_and_fallback_answers(offline_env, monkeypatch):
-    def cut_off(question, store, answerer, top_k, min_score):
+    def cut_off(question, retrieve, answerer):
         return Answer(
             question,
             [Segment("Half an ans")],
@@ -168,3 +168,97 @@ def test_ingest_reports_an_unsupported_file(offline_env, tmp_path):
     result = runner.invoke(app, ["ingest", str(notes)])
     assert result.exit_code == 1
     assert "Unsupported file type: notes.docx" in result.output
+
+
+def test_search_shows_rerank_scores_unless_told_not_to(offline_env):
+    assert runner.invoke(app, ["ingest", SAMPLE]).exit_code == 0
+    reranked = runner.invoke(app, ["search", "HNSW index", "-k", "2"])
+    assert reranked.exit_code == 0, reranked.output
+    assert "rerank" in reranked.output  # hashing embedder -> the lexical reranker
+    plain = runner.invoke(app, ["search", "HNSW index", "-k", "2", "--no-rerank"])
+    assert "rerank" not in plain.output
+    assert "[2]" in plain.output
+
+
+def test_explains_a_reranking_model_that_cannot_be_downloaded(offline_env, monkeypatch):
+    from types import ModuleType
+
+    def offline(model_name):
+        raise ValueError(f"Could not load model {model_name} from any source.")
+
+    module = ModuleType("fastembed.rerank.cross_encoder")
+    module.TextCrossEncoder = offline
+    monkeypatch.setitem(sys.modules, "fastembed", ModuleType("fastembed"))
+    monkeypatch.setitem(sys.modules, "fastembed.rerank", ModuleType("fastembed.rerank"))
+    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", module)
+    monkeypatch.setenv("RAG_RERANKER", "cross-encoder")
+    result = runner.invoke(app, ["search", "anything"])
+    assert result.exit_code == 1
+    assert "Couldn't load the reranking model" in result.output
+    assert "RAG_RERANKER=lexical" in result.output
+
+
+def test_the_agent_needs_claude(offline_env):
+    result = runner.invoke(app, ["ask", "--agent", "anything"])
+    assert result.exit_code == 1
+    assert "The agent needs Claude" in result.output
+
+
+def test_ask_agent_shows_steps_sources_and_a_failed_check(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult, Citation, Source, Step
+
+    sources = [
+        Source("Qdrant uses HNSW.", "docs/v.md", "Vector", 0.81, {"chunk_index": 0}),
+        Source("HNSW is a graph.", "https://example.com/hnsw", "HNSW explained", 0.0, kind="web"),
+        Source(
+            "Latest is 1.20.0.", "https://pypi.org/project/qdrant-client/", "PyPI", 0.0, kind="api"
+        ),
+        Source("Unused chunk.", "docs/other.md", "Other", 0.42),
+    ]
+    answer = Answer(
+        "q",
+        [
+            Segment(
+                "Qdrant uses HNSW, a graph.",
+                [Citation(0, "Qdrant uses HNSW."), Citation(1, "HNSW is a graph.")],
+            ),
+            Segment(" The latest client is 1.20.0.", [Citation(2, "Latest is 1.20.0.")]),
+            Segment(" It is the fastest."),
+        ],
+        sources,
+        model="claude-opus-5-5",
+        stop_reason="end_turn",
+        steps=[
+            Step("search_documents", "HNSW", "2 passage(s)"),
+            Step("web_fetch", "https://example.com/hnsw", "page read"),
+            Step("self_check", "claude-haiku-5-5", "partly_supported"),
+        ],
+        check=CheckResult("partly_supported", ["It is the fastest."], "Remove the speed claim."),
+    )
+
+    class FakeAgent:
+        def answer(self, question):
+            return answer
+
+    monkeypatch.setenv("RAG_LLM", "claude")
+    monkeypatch.setattr("rag_assistant.agent.get_agent", lambda settings, retrieve: FakeAgent())
+    result = runner.invoke(app, ["ask", "--agent", "-v", "q"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Qdrant uses HNSW, a graph. [1][2] The latest client is 1.20.0. [3]" in out
+    assert "https://example.com/hnsw  (HNSW explained, web)" in out
+    assert "https://pypi.org/project/qdrant-client/  (PyPI, API)" in out
+    assert "other.md  (Other, similarity 0.42)" in out  # retrieved but not cited
+    assert '2. web_fetch "https://example.com/hnsw" -> page read' in out
+    assert "(Self-check: partly supported." in out
+    assert "Not supported by its sources: It is the fastest." in out
+    assert "Remove the speed claim.)" in out
+
+
+def test_ask_warns_when_the_agent_runs_out_of_turns(offline_env, monkeypatch):
+    def stopped(question, retrieve, answerer):
+        return Answer(question, [Segment("Partial")], [], stop_reason="tool_use")
+
+    monkeypatch.setattr("rag_assistant.cli.answer_question", stopped)
+    result = runner.invoke(app, ["ask", "anything"])
+    assert "used all RAG_AGENT_MAX_TURNS replies" in result.output
