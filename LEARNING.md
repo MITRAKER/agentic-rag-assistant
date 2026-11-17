@@ -276,7 +276,7 @@ numbers itself: it can cite the wrong chunk, a chunk that doesn't exist, or
     "type": "search_result",
     "source": "data/sample/vector-databases.md",
     "title": "Vector Databases",
-    "content": [                       # one text block per sentence
+    "content": [  # one text block per sentence
         {"type": "text", "text": "Qdrant uses HNSW, a layered graph ..."},
         {"type": "text", "text": "Searches can filter on the payload ..."},
     ],
@@ -291,13 +291,17 @@ material carries a list of citations:
 {
     "type": "text",
     "text": "Qdrant builds an HNSW index, a layered graph ...",
-    "citations": [{
-        "type": "search_result_location",
-        "search_result_index": 0,          # which search result (0-based)
-        "cited_text": "Qdrant uses HNSW, a layered graph ...",
-        "start_block_index": 0, "end_block_index": 1,
-        "source": "...", "title": "...",
-    }],
+    "citations": [
+        {
+            "type": "search_result_location",
+            "search_result_index": 0,  # which search result (0-based)
+            "cited_text": "Qdrant uses HNSW, a layered graph ...",
+            "start_block_index": 0,
+            "end_block_index": 1,
+            "source": "...",
+            "title": "...",
+        }
+    ],
 }
 ```
 
