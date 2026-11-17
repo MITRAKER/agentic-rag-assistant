@@ -1,0 +1,60 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please **never paste an API key** or private documents here.
+        Found a security problem? Don't open an issue: follow [SECURITY.md](https://github.com/MITRAKER/agentic-rag-assistant/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect to see instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, starting from a fresh clone if you can.
+      placeholder: |
+        1. rag ingest data/sample
+        2. rag ask "..."
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output or error message
+      description: Paste the full output. It's formatted as code automatically.
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `python -c "import rag_assistant; print(rag_assistant.__version__)"`, or the commit you're on.
+    validations:
+      required: true
+  - type: dropdown
+    id: python
+    attributes:
+      label: Python version
+      options: ["3.11", "3.12", "3.13", "3.14", "Other"]
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: ["Linux", "macOS", "Windows", "Other"]
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed API keys, secrets and private data from everything above.
+          required: true

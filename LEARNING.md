@@ -8,6 +8,7 @@ This file grows with the project. Each step explains **what** was built,
 |------|-------|--------|
 | 1 | Ingestion: load, chunk, embed, store | ✅ done |
 | 2 | Answering questions with citations | ✅ done |
+| ⚙️ | [Engineering standards](#engineering-standards): CI/CD, NASA/JPL rules, security | ✅ done |
 | 3 | The agent: routing, ranking, self-checking | ⏳ next |
 | 4 | Chat UI and Docker | ⏳ |
 | 5 | Evaluation and a resume-ready README | ⏳ |
@@ -85,10 +86,10 @@ Our splitter is **recursive**:
    single newlines, then sentences (`". "`), then words, then a hard cut.
 2. Greedily pack small pieces back together until the next one would exceed
    `chunk_size`.
-3. Start every new chunk with up to `overlap` (120) characters from the end
-   of the previous chunk, cut at a sentence boundary so a chunk never starts
-   mid-sentence. (The first version cut at exactly 120 characters; step 2,
-   concept 7 explains why we changed it.)
+3. Start every new chunk by repeating the last whole sentences of the
+   previous chunk, about `overlap` (120) characters' worth, so a chunk never
+   starts mid-sentence. (The first version copied exactly 120 characters;
+   step 2, concept 7 explains why we changed it.)
 
 Why the overlap? Imagine the answer is a sentence that happens to sit across a
 chunk boundary. Without overlap, half of it is in chunk 7 and half in chunk 8,
@@ -166,7 +167,7 @@ Running `rag ingest` twice must not store everything twice. Two tricks:
 ### Concept 6: Tests that do not need the internet
 
 `tests/conftest.py` builds an **in-memory Qdrant** with the **hashing
-embedder**, so the tests run in about a second, with no Docker,
+embedder**, so the tests run in a few seconds, with no Docker,
 download or API key. That is what makes the GitHub Actions CI
 (`.github/workflows/ci.yml`) cheap and reliable.
 
@@ -401,8 +402,13 @@ chunks started mid-sentence, and those fragments became "sentences".
 
 Two fixes:
 
-1. `_overlap_tail()` in `chunking.py` now starts the overlap at a sentence
-   boundary (falling back to a line break, then a word break).
+1. `_overlap_tail()` in `chunking.py` now repeats the last *whole sentences*
+   of the previous chunk that fit in the overlap. If even the last sentence is
+   longer, it repeats that one sentence when the next chunk has room for it,
+   and otherwise adds no overlap at all. Only text without any sentence ends
+   falls back to line breaks, then word breaks. (The first version of this
+   fix fell back to a word break whenever the last sentence was long; a test
+   written for the engineering standards caught that.)
 2. `split_sentences()` in `text.py` joins hard-wrapped lines back together. In
    Markdown, a single newline inside a paragraph usually doesn't end a sentence.
 
@@ -444,3 +450,284 @@ Step 3 makes the assistant **agentic**: it decides *where* to look (your
 documents, the web, or an API), reranks the evidence so the best comes first,
 and checks its own answer against the citations, retrying when the answer
 isn't grounded.
+
+---
+
+## Engineering standards
+
+**Goal:** make quality automatic. Every change is checked the same way, by
+machines, before it can reach `main`. The project stays reliable as it grows,
+and anyone who opens the repository can see how it's built and tested.
+
+This isn't a step of the assistant itself. It was applied to everything built
+in steps 1 and 2, and every later step follows it from the first line.
+
+### What was added
+
+| File | Job |
+|------|-----|
+| `.github/workflows/ci.yml` | **CI**: lint, types, rules, tests, security scans and a package build on every pull request |
+| `.github/workflows/codeql.yml` | CodeQL code scanning on every pull request and every week |
+| `.github/workflows/release.yml` | **CD**: publishes a GitHub release when a version tag is pushed |
+| `.github/dependabot.yml` | Weekly pull requests that update the dependencies and the actions |
+| `.pre-commit-config.yaml` | The same checks on your machine, before every commit |
+| `tools/power_of_ten.py` | Checks the NASA/JPL rules that no standard tool covers |
+| `tools/release_notes.py` | Pulls one version's notes out of CHANGELOG.md for its release |
+| `pyproject.toml` | Settings for ruff, mypy, pytest, coverage and Bandit, and the exact dev tool versions |
+| `Makefile` | Short names for the commands: `make check`, `make test`, ... |
+| `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md` | How to contribute, how to report a vulnerability, how to behave, and what changed |
+| `.github/ISSUE_TEMPLATE/`, `pull_request_template.md`, `CODEOWNERS` | Structured issues, a checklist on every pull request, automatic reviewers |
+| `.editorconfig` | Every editor uses the same indentation and line endings |
+
+Try it:
+
+```bash
+pip install -e ".[dev]"
+pre-commit install      # from now on the checks run on every `git commit`
+make check              # everything CI runs (or: pre-commit run --all-files && pytest --cov)
+```
+
+### Concept 1: NASA/JPL's "Power of Ten"
+
+In 2006 Gerard Holzmann, of NASA's Jet Propulsion Laboratory, published *The
+Power of Ten: Rules for Developing Safety-Critical Code*. JPL writes software
+for spacecraft, where you can't fix a bug by restarting the program, so the
+rules aim at one thing: code simple enough that tools can check it and people
+can verify it. They were written for C, and JPL later built them into its C
+coding standard for flight software.
+
+Python isn't C: it has no pointers, no preprocessor and no manual memory
+management. So six rules carry over directly (1, 2, 4, 6, 7, 10), and four
+keep their *intent* in a Python form (3, 5, 8, 9):
+
+| # | Original rule (for C) | Our Python version | Enforced by |
+|---|-----------------------|--------------------|-------------|
+| 1 | Simple control flow: no `goto`, no `setjmp`/`longjmp`, no recursion | No recursion: a function never calls itself | `tools/power_of_ten.py` (R1) |
+| 2 | Every loop has a fixed upper bound | No `while True`. Loops run over finite collections, or over `range(limit)` when the number of steps isn't obvious. (The package has no `while` loops at all.) | `tools/power_of_ten.py` (R2), review |
+| 3 | No dynamic memory allocation after start-up | Python allocates all the time, so we keep the intent: bound what one run can use. At most 10,000 files and 100 MB per file per ingest, uploads in batches of 64, and `max_tokens` on every model reply | limits in `loaders.py` and `vectorstore.py`, with tests |
+| 4 | A function fits on one printed page (about 60 lines) | At most 60 lines, complexity at most 10, at most 12 branches and 6 arguments | `tools/power_of_ten.py` (R4), ruff `C90` and `PL` rules |
+| 5 | At least two assertions per function, on average | Check inputs and states with explicit `if ...: raise ValueError(...)`, never `assert`: Python deletes asserts when run with `-O`. Settings are validated by pydantic | ruff `S101` (no `assert` outside tests), a test for each error |
+| 6 | Declare data in the smallest possible scope | No `global` or `nonlocal`, and no mutable containers at module level (constants are tuples or frozensets) | `tools/power_of_ten.py` (R6), ruff `PLW0603` |
+| 7 | Check every return value, validate every parameter | Check what comes back (the model's `stop_reason`, citation indexes in range, an empty search) and what goes in | mypy, tests, review |
+| 8 | Use the preprocessor only for simple things | No metaprogramming: no `eval`, no `exec`, no code built from strings | ruff `S307` and `S102`, Bandit |
+| 9 | Restrict pointers: one level of dereferencing, no function pointers | Python has no pointers. The intent (data flow that tools can follow) becomes: every function is fully typed | mypy `--strict` |
+| 10 | Compile with all warnings on, fix them all, run static analysers daily | Zero warnings: ruff, mypy and Bandit must be clean, pytest turns any warning into an error, and CI runs on every change and every week | CI, pre-commit, `filterwarnings = ["error"]` |
+
+Why bother in a RAG assistant? Each rule prevents a real kind of bug, cheaply.
+Recursion can overflow the stack on a deeply nested input. A loop without a
+bound can hang ingestion on one strange file. A 200-line function hides bugs
+from reviewers. Global state makes tests depend on the order they run in.
+
+**How `tools/power_of_ten.py` works.** It parses each file into an *abstract
+syntax tree* (AST) with Python's built-in `ast` module, the same structure the
+interpreter uses, and walks every node looking for patterns: a call to the
+function's own name (recursion), a `while` whose condition is the constant
+`True`, a function spanning more than 60 lines, a `global` statement, or a
+list, dict or set assigned at module level. It's about 100 lines and has its
+own tests in `tests/test_power_of_ten.py`. Know its limits: it catches a
+function calling itself, but not two functions calling each other (exercise 2).
+
+### Concept 2: The toolbox
+
+Each tool answers a different question:
+
+| Question | Tool | Kind |
+|----------|------|------|
+| Does the code follow the style rules and avoid known bug patterns? | `ruff check` | linter |
+| Is it laid out consistently? | `ruff format` | formatter |
+| Do the types fit (no `None` where a `str` is needed, no misspelt attribute)? | `mypy --strict` | type checker |
+| Does it follow the Power of Ten? | `tools/power_of_ten.py` | custom checker |
+| Does it behave correctly? | `pytest` | tests |
+| Which code do the tests never run? | coverage.py, through pytest-cov | coverage |
+| Does our code contain insecure patterns (`eval`, `shell=True`, weak hashes, hard-coded passwords)? | Bandit | SAST |
+| Can outside data flow into something dangerous? | CodeQL | SAST with data-flow analysis |
+| Do our dependencies have known vulnerabilities? | pip-audit, Dependabot | SCA |
+| Are the files tidy (whitespace, line endings, valid YAML and TOML, no merge markers, no private keys, no huge files)? | pre-commit-hooks | hygiene |
+
+Two acronyms you'll hear in interviews: **SAST** (static application security
+testing) reads *your* code looking for vulnerabilities. **SCA** (software
+composition analysis) checks the *libraries you depend on* against databases
+of known vulnerabilities (CVEs).
+
+Three settings worth understanding:
+
+* **Branch coverage of at least 90%.** Line coverage asks "did each line
+  run?". Branch coverage also asks "did each `if` go both ways?". The build
+  fails below 90%, so tests can't quietly fall behind the code. Remember that
+  coverage shows what is *untested*, not what is *correct*: 100% coverage with
+  weak assertions proves little.
+* **`filterwarnings = ["error"]`.** Any warning raised during the tests fails
+  them. That's rule 10, and it found a real leak (concept 5).
+* **Exact versions for the dev tools** (`ruff==0.17.5`). New tool releases add
+  rules, so with unpinned tools a check can fail on code that didn't change.
+  Pinned tools only change through a Dependabot pull request, where CI shows
+  exactly what the update breaks. Runtime dependencies use minimum versions
+  instead (`anthropic>=2.9`), so the package can be installed next to other
+  software.
+
+### Concept 3: CI/CD
+
+**CI (continuous integration)**: everyone merges small changes into `main`
+often, and every change is verified automatically first. **CD (continuous
+delivery)**: turning a verified version into something people can install,
+done by a machine, the same way every time.
+
+The life of a change in this repository:
+
+```
+your machine   git commit ──► pre-commit: hygiene, ruff, mypy, Power of Ten (seconds)
+               git push, then open a pull request
+GitHub         CI workflow:
+                 quality: every pre-commit hook on every file ─┐
+                 tests on Python 3.11, 3.12, 3.13 and 3.14 ────┤
+                 security: Bandit and pip-audit ───────────────┼──► "CI passed"
+                 build: the wheel, plus an offline smoke test ─┘
+               CodeQL workflow: findings in the Security tab and on the pull request
+               review by the code owner, then squash-merge into main
+release        git tag v0.2.0 && git push origin v0.2.0
+               Release workflow: tag matches __version__? ─► tests ─► build ─► GitHub release
+every Monday   CI and CodeQL run again on main; Dependabot opens update pull requests
+```
+
+What makes these workflows professional rather than merely working:
+
+* **Least privilege.** `permissions: contents: read` at the top of each
+  workflow: jobs can read the code but not push, comment or publish. Only the
+  release job gets `contents: write`, because it creates releases. If a
+  compromised dependency ever ran inside CI, it couldn't do much.
+* **`persist-credentials: false`.** The checkout step normally saves an access
+  token so later steps can run git commands. No step here needs it, so it isn't
+  kept.
+* **Timeouts.** A hung job is stopped after 10 to 20 minutes, instead of
+  GitHub's default of six hours.
+* **Concurrency.** A new push to a pull request cancels its older run, which
+  can no longer tell you anything useful.
+* **A test matrix.** The same tests run on four Python versions in parallel.
+  `fail-fast: false` lets every version finish, so you see all failures at once.
+* **A smoke test of the real artifact.** The tests import the code from `src/`.
+  The build job instead installs the *built wheel* into an empty environment
+  and runs `rag ingest` and `rag ask` offline. That catches packaging mistakes
+  (a missing file, a broken entry point) that unit tests can't see.
+* **One required check.** The `CI passed` job succeeds only when every other
+  job did. Branch protection then requires just that one check, so adding a
+  Python version later doesn't mean editing the protection rules.
+* **Scheduled runs.** Every Monday, CI runs even if nothing changed, because
+  the world did: new vulnerabilities get published, and new releases of our
+  dependencies can break us.
+* **Pinned actions.** Actions are pinned to a major version (`actions/checkout@v7`)
+  and Dependabot keeps them current. Pinning to a full commit SHA is stronger
+  still (exercise 6).
+* **No secrets in CI.** No job needs the Anthropic API key, because no test
+  calls the real API.
+
+CI earned its keep on its first real run: step 2's pull request failed because
+`ruff format --check` also checks the Python examples inside Markdown files,
+and this guide had one hand-aligned example. One formatting commit fixed it.
+Checking every file, every time, is exactly what CI is for.
+
+### Concept 4: The files every professional repository has
+
+| File | Why it exists |
+|------|---------------|
+| README with badges | The first thing visitors (and recruiters) see: what it is, how to run it, whether it's healthy |
+| LICENSE (MIT) | Without a license, nobody may legally reuse the code, even when it's public |
+| CONTRIBUTING.md | How to set up, which checks to run, how to submit a change and make a release |
+| CODE_OF_CONDUCT.md | How people are expected to treat each other |
+| SECURITY.md | How to report a vulnerability privately, instead of in a public issue attackers can read |
+| CHANGELOG.md | What changed in each version, written for users rather than developers |
+| Issue forms | Bug reports arrive with the version, the Python version, steps to reproduce, and no API keys |
+| Pull request template | Every pull request explains what, why and how it was tested, and ticks the same checklist |
+| CODEOWNERS | GitHub asks the right person to review, automatically |
+| `.editorconfig` | Every editor uses the same indentation and line endings |
+| Makefile | `make check` is easier to remember than five commands |
+
+Two conventions tie them together:
+
+* **Semantic Versioning** (`MAJOR.MINOR.PATCH`): raise PATCH for bug fixes,
+  MINOR for new features, MAJOR for changes that break existing use. A version
+  starting with `0.` means "still settling".
+* **Conventional Commits** (`feat: ...`, `fix: ...`, `docs: ...`): commit
+  messages that say what kind of change they are, so the history is easy to
+  scan and the changelog is easy to write.
+
+### Concept 5: What the standards changed in steps 1 and 2
+
+Applying the rules to code that already worked still changed it:
+
+* **Rule 1.** The chunker's recursive splitter became a loop over an explicit
+  stack. To prove the rewrite changed nothing, the old and new versions were
+  run on 3,000 random texts and gave identical output. That's *differential
+  testing*: when you rewrite code, the old version is the perfect reference.
+* **Rule 2.** The splitter's loop has a computed maximum number of steps. If it
+  is ever exceeded, it stops with an error instead of hanging.
+* **Rule 3.** Ingestion refuses more than 10,000 files, or any file over
+  100 MB, with a clear message. A typo like `rag ingest /` fails fast instead
+  of reading your whole disk.
+* **Rule 4.** Long functions were split into named helpers: for example
+  `ExtractiveAnswerer.answer` into `find_candidates` and `_pick`, and the
+  refusal handling of `parse_response` into `_refused`.
+* **Rules 5 and 7.** Constructors reject impossible values (`max_tokens=0`,
+  `max_sentences=0`, `top_k=0`, `batch_size=0`). Settings have limits, so
+  `RAG_TOP_K=0` stops the program with `Invalid settings: RAG_TOP_K: Input
+  should be greater than or equal to 1` instead of a traceback, and the CLI
+  explains a missing file, an unsupported file or an API error the same way.
+* **Rule 6.** Module-level lists and sets became tuples and frozensets, so no
+  code can change them by accident.
+* **Rule 9.** mypy's strict mode replaced every `Any` and bare `dict` with a real
+  type, including the Anthropic SDK's own (`BetaMessage`,
+  `BetaSearchResultBlockParam`). String checks such as `block.type == "text"`
+  became `isinstance` checks, which mypy understands.
+* **Rule 10.** Turning warnings into errors exposed a resource leak inside
+  qdrant-client's embedded mode: it opens a temporary SQLite connection and
+  never closes it. The bug is in the dependency, not in our code, so
+  `pyproject.toml` ignores exactly that one warning, with a comment saying why
+  and when to remove it. Never silence every warning to get a green build.
+
+The new tests also found two real bugs:
+
+1. **The test embedder could hide matches.** `HashingEmbedder` used to add +1
+   or -1 per word, depending on a hash ("signed" feature hashing). When two
+   words landed in the same bucket with opposite signs they cancelled out, and
+   a query could score 0.0 against the very chunk that contained its words.
+   Now every word adds +1, and stopwords such as "the" are skipped, so
+   unrelated texts score 0 and related ones score above 0.
+2. **The overlap could still start mid-sentence.** When a chunk's last
+   sentence was longer than the overlap budget, step 2's fix fell back to a
+   word boundary. Step 2, concept 7 describes the corrected rule.
+
+### Exercises
+
+1. **Break a rule on purpose.** Add a recursive function to
+   `src/rag_assistant/text.py` (a recursive factorial will do) and run
+   `make power-of-ten`. Then try to commit it and watch pre-commit stop you.
+   Undo the change afterwards.
+2. **See what the checker sees.** Run
+   `python -c "import ast; print(ast.dump(ast.parse('while True: pass'), indent=2))"`
+   and find the node that `is_unbounded_while` looks for. Then extend
+   `tools/power_of_ten.py` to catch *mutual* recursion (`f` calls `g`, `g` calls
+   `f`), with a test.
+3. **Read a CI run.** On GitHub, open the Actions tab and pick a run. Find the
+   coverage table in the run's summary, the `CI passed` job, and the `dist`
+   artifact you can download.
+4. **Raise the bar.** Set `fail_under = 95` in `pyproject.toml`, run
+   `make test`, and write tests for the lines it lists until it passes.
+5. **Protect `main`.** In the repository's Settings, add a branch protection
+   rule (or ruleset) for `main`: require a pull request, require the
+   `CI passed` and `Analyze (Python)` checks, and block force pushes. Then try
+   to push directly to `main`.
+6. **Harden the supply chain.** Replace `actions/checkout@v7` with the full
+   commit SHA of that release, followed by a `# v7` comment. Why is a SHA safer
+   than a tag? (Hint: who can move a tag?)
+7. **Ship a release.** Once the pull requests are merged, follow "Releases" in
+   CONTRIBUTING.md to publish v0.2.0, and look at the release page the
+   workflow creates.
+8. **Interview questions to practise:** *"What's the difference between CI and
+   CD?"*, *"What do SAST and SCA mean, and which tools here do which?"* and
+   *"Tell me about a coding standard you've applied."* The Power of Ten table
+   is a strong answer to the last one.
+
+### What's next
+
+Step 3 builds the agent: routing between your documents, the web and APIs,
+reranking the evidence, and checking its own answers. It's written to these
+standards from the start.

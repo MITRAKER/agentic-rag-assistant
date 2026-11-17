@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MITRAKER/agentic-rag-assistant/security/advisories/new
+    about: Please report security problems privately, never in a public issue.
+  - name: Learning guide
+    url: https://github.com/MITRAKER/agentic-rag-assistant/blob/main/LEARNING.md
+    about: How each part of the assistant was built and why.

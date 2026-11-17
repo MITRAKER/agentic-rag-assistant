@@ -1,5 +1,15 @@
 # Agentic RAG Knowledge Assistant
 
+[![CI](https://github.com/MITRAKER/agentic-rag-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/MITRAKER/agentic-rag-assistant/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/MITRAKER/agentic-rag-assistant/actions/workflows/codeql.yml/badge.svg)](https://github.com/MITRAKER/agentic-rag-assistant/actions/workflows/codeql.yml)
+[![Python 3.11 to 3.14](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](pyproject.toml)
+[![Coverage at least 90%](https://img.shields.io/badge/coverage-%E2%89%A590%25-brightgreen)](pyproject.toml)
+[![mypy strict](https://img.shields.io/badge/mypy-strict-blue)](https://mypy.readthedocs.io/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](.pre-commit-config.yaml)
+[![NASA/JPL Power of Ten](https://img.shields.io/badge/NASA%2FJPL-Power%20of%20Ten-orange)](LEARNING.md#engineering-standards)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 An assistant that answers questions from your own documents, decides where to
 search (documents, web or APIs), checks that its answer is supported, and cites
 its sources.
@@ -9,13 +19,16 @@ its sources.
 
 ## Status
 
-- [x] **Step 1: Ingestion.** Load PDF, Markdown, text and HTML; recursive chunking with overlap; local embeddings; Qdrant storage; idempotent re-ingest
+- [x] **Step 1: Ingestion.** Load PDF, Markdown, text and HTML; recursive chunking with sentence-aligned overlap; local embeddings; Qdrant storage; idempotent re-ingest
 - [x] **Step 2: Answers with citations.** Claude with native `search_result` citations (sentence-level quotes), refusal and fallback handling, an offline extractive baseline, `rag ask`
+- [x] **Engineering standards.** CI/CD on GitHub Actions, the NASA/JPL Power of Ten rules adapted to Python, strict typing, security scanning, release automation
 - [ ] Step 3: Agentic layer (routing, ranking, self-check)
 - [ ] Step 4: Chat UI and Docker
 - [ ] Step 5: Evaluation
 
 ## Quick start
+
+Needs Python 3.11 or newer.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -29,10 +42,12 @@ rag ask "How does Qdrant find similar vectors quickly?" -v
 RAG_LLM=extractive rag ask "..."       # offline, no API key needed
 
 rag stats
-pytest                                 # runs offline in about a second
+pytest                                 # runs offline in a few seconds
 ```
 
-Settings are environment variables; see [`.env.example`](.env.example).
+Settings are environment variables; see [`.env.example`](.env.example). An
+invalid value (for example `RAG_TOP_K=0`) stops the program with a message
+naming the variable.
 
 ## Architecture (so far)
 
@@ -45,10 +60,44 @@ QUERY      rag ask "question" ─► embed ─► top-k search ◄────�
                      Claude (search_result blocks, citations on) ─► answer + [n] citations
 ```
 
+## Quality and engineering standards
+
+Every pull request runs the same checks, on GitHub and (through pre-commit)
+on your machine before each commit:
+
+| Area | What runs |
+|------|-----------|
+| Style and bugs | ruff (pycodestyle, pyflakes, bugbear, bandit rules, complexity limits and more) |
+| Formatting | ruff format, including the Python examples in Markdown |
+| Types | mypy in strict mode |
+| Safety rules | [NASA/JPL Power of Ten](LEARNING.md#engineering-standards), adapted to Python and checked by [`tools/power_of_ten.py`](tools/power_of_ten.py) |
+| Tests | pytest on Python 3.11, 3.12, 3.13 and 3.14; at least 90% branch coverage; any warning fails the run |
+| Security | Bandit and CodeQL for the code, pip-audit and Dependabot for the dependencies |
+| Packaging | the wheel is built, installed in a clean environment and used offline |
+| Releases | pushing a `vX.Y.Z` tag publishes a GitHub release with notes from [CHANGELOG.md](CHANGELOG.md) |
+
+`make check` runs everything locally. [CONTRIBUTING.md](CONTRIBUTING.md) has
+the details.
+
+## Project layout
+
+```
+src/rag_assistant/     the package: ingestion/, answering/, cli.py, config.py, ...
+tests/                 pytest suite (offline: in-memory Qdrant, fake Claude client)
+tools/                 power_of_ten.py (rule checker), release_notes.py
+data/sample/           three small Markdown documents to try things on
+.github/               CI, CodeQL and release workflows, Dependabot, templates
+```
+
 ## Tech stack
 
-Python · Claude API (Claude Opus 5.5, native citations) · Qdrant · fastembed (BAAI/bge-small-en-v1.5) · pypdf · BeautifulSoup · Typer · pytest · GitHub Actions
+Python · Claude API (Claude Opus 5.5, native citations) · Qdrant · fastembed (BAAI/bge-small-en-v1.5) · pypdf · BeautifulSoup · Typer · pydantic-settings · pytest · ruff · mypy · GitHub Actions · CodeQL
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and the
+[code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)
