@@ -11,18 +11,28 @@ Strategy ("recursive character splitting"):
      (paragraphs). If a piece is still too big, split it on single newlines,
      then sentences, then words.
   2. Greedily pack the small pieces back together up to `chunk_size`.
-  3. Start each new chunk with the last `overlap` characters of the previous
-     one, so a sentence that straddles a boundary still appears whole somewhere.
+  3. Start each new chunk with the last whole sentence(s) of the previous one,
+     up to `overlap` characters, so context that straddles a boundary still
+     appears whole somewhere. (Overlap snaps to sentence boundaries, or to
+     word boundaries when there are none, so chunks never start mid-sentence.)
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 
 from rag_assistant.ingestion.loaders import Document
 
 SEPARATORS = ["\n\n", "\n", ". ", " "]
+# Places where an overlap may start, best first: after a sentence end or a blank
+# line, then after any line break, then after any whitespace (between words).
+_BOUNDARIES = [
+    re.compile(r"(?<=[.!?])\s+|\n\s*\n"),
+    re.compile(r"\n"),
+    re.compile(r"\s+"),
+]
 
 
 @dataclass
@@ -77,14 +87,29 @@ def split_text(text: str, chunk_size: int = 800, overlap: int = 120) -> list[str
         if current and len(current) + len(piece) > chunk_size:
             chunks.append(current)
             # carry the tail of the previous chunk forward as overlap,
-            # trimmed so the next chunk still has room for `piece`
-            tail_len = max(0, min(overlap, chunk_size - len(piece)))
-            current = current[-tail_len:] if tail_len else ""
+            # limited so the next chunk still has room for `piece`
+            current = _overlap_tail(current, min(overlap, chunk_size - len(piece)))
         current += piece
     if current:
         chunks.append(current)
 
     return [c.strip() for c in chunks if c.strip()]
+
+
+def _overlap_tail(chunk: str, limit: int) -> str:
+    """The longest tail of `chunk` (at most `limit` chars) that starts at a clean boundary.
+
+    A raw `chunk[-limit:]` usually starts mid-word or mid-sentence, and those
+    fragments later show up in search results and citations. So we prefer a
+    tail made of whole sentences, and fall back to whole words.
+    """
+    if limit <= 0:
+        return ""
+    for boundary in _BOUNDARIES:
+        starts = [m.end() for m in boundary.finditer(chunk) if len(chunk) - m.end() <= limit]
+        if starts and starts[0] < len(chunk):
+            return chunk[starts[0] :]
+    return ""
 
 
 def chunk_document(doc: Document, chunk_size: int = 800, overlap: int = 120) -> list[Chunk]:
