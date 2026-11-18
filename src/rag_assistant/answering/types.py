@@ -151,4 +151,5 @@ class Answer:
 class Answerer(Protocol):
     """Anything that turns a question + retrieved sources into an Answer."""
 
-    def answer(self, question: str, sources: list[Source]) -> Answer: ...
+    def answer(self, question: str, sources: list[Source]) -> Answer:
+        """An answer to `question` that cites `sources` by their position in the list."""

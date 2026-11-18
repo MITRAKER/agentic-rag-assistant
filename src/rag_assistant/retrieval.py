@@ -41,7 +41,8 @@ class RerankerModelError(RuntimeError):
 
 
 class Reranker(Protocol):
-    def rerank(self, query: str, sources: list[Source], top_k: int) -> list[Source]: ...
+    def rerank(self, query: str, sources: list[Source], top_k: int) -> list[Source]:
+        """The best `top_k` of `sources` for `query`, best first, each with its rerank_score."""
 
 
 class CrossEncoderReranker:
