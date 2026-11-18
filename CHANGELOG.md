@@ -6,6 +6,44 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
+
+### Added
+
+- An agent (`rag ask --agent`). Claude chooses where to look for each
+  question, in a loop with hard limits: the user's documents
+  (`search_documents`), live package data from the PyPI JSON API
+  (`lookup_python_package`), and web search and web fetch, which run on
+  Anthropic's servers. Every tool result is citable, so each quote in the
+  answer comes from something a tool really returned. `rag ask --agent -v`
+  prints the steps the agent took.
+- A self-check. A second, smaller model reads each statement of the answer
+  next to the passages it cites and returns a verdict in a fixed JSON shape.
+  When the answer isn't supported, the agent revises it with that feedback.
+- Reranking. Vector search fetches more candidates than it needs
+  (`RAG_RERANK_CANDIDATES`, 20 by default) and a reranker keeps the best
+  `RAG_TOP_K`: a local cross-encoder (ms-marco-MiniLM-L-6-v2 through
+  fastembed, an 80 MB download on first use) or, offline, a lexical reranker
+  that fuses the vector order with keyword overlap. `rag search` prints both
+  scores, and `--no-rerank` shows the vector order alone.
+- Settings for all of this, each validated at start-up: `RAG_RERANKER`,
+  `RAG_RERANK_MODEL`, `RAG_RERANK_CANDIDATES`, `RAG_AGENT_MAX_TURNS`,
+  `RAG_AGENT_TOOL_BUDGET`, `RAG_AGENT_WEB`, `RAG_AGENT_PYPI`,
+  `RAG_AGENT_SELF_CHECK`, `RAG_AGENT_CHECK_MODEL` and `RAG_AGENT_RETRIES`.
+  See [.env.example](.env.example).
+- Safety limits for the agent: a per-question cap on replies and on uses of
+  each tool, a fixed host, name check, timeout and 5 MB reply cap for PyPI,
+  and web fetch restricted to URLs the user typed or web search found.
+
+### Changed
+
+- `rag ask` and `rag search` rerank by default (`RAG_RERANKER=auto`). Set
+  `RAG_RERANKER=none` for the previous behaviour.
+- `answer_question()` takes a retriever (any function from a query to a list
+  of sources) instead of a vector store, `top_k` and `min_score`, and
+  `rag_assistant.answering.retrieve()` is replaced by
+  `rag_assistant.retrieval.Retriever`.
+
 ## [0.2.0] - 2026-11-17
 
 The first release. It contains steps 1 and 2 of [LEARNING.md](LEARNING.md) and
