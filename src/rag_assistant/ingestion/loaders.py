@@ -8,8 +8,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, TypeAlias
 
-SUPPORTED_SUFFIXES = {".pdf", ".md", ".markdown", ".txt", ".html", ".htm"}
+Metadata: TypeAlias = dict[str, Any]  # JSON-like values: page number, title, ...
+
+SUPPORTED_SUFFIXES = frozenset({".pdf", ".md", ".markdown", ".txt", ".html", ".htm"})
+# Upper bounds on the work one ingest can do (Power of Ten rules 2 and 3):
+# a typo like `rag ingest /` fails fast instead of reading the whole disk.
+MAX_FILES = 10_000
+MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB
+
+
+class IngestionError(ValueError):
+    """A file or folder that can't be ingested: unsupported, too big, or too many files."""
 
 
 @dataclass
@@ -18,7 +29,7 @@ class Document:
 
     text: str
     source: str  # file path (or URL later on)
-    metadata: dict = field(default_factory=dict)  # e.g. {"page": 3, "title": "..."}
+    metadata: Metadata = field(default_factory=dict)  # e.g. {"page": 3, "title": "..."}
 
 
 def _load_pdf(path: Path) -> list[Document]:
@@ -55,8 +66,11 @@ def _load_text(path: Path) -> list[Document]:
     return [Document(text=text, source=str(path), metadata={"title": title})]
 
 
-def load_file(path: str | Path) -> list[Document]:
+def load_file(path: str | Path, max_bytes: int = MAX_FILE_BYTES) -> list[Document]:
     path = Path(path)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise IngestionError(f"{path.name} is {size:,} bytes; the limit is {max_bytes:,}")
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         return _load_pdf(path)
@@ -64,10 +78,21 @@ def load_file(path: str | Path) -> list[Document]:
         return _load_html(path)
     if suffix in {".md", ".markdown", ".txt"}:
         return _load_text(path)
-    raise ValueError(f"Unsupported file type: {path.name}")
+    raise IngestionError(f"Unsupported file type: {path.name}")
 
 
-def load_path(path: str | Path) -> list[Document]:
+def find_files(folder: Path, max_files: int = MAX_FILES) -> list[Path]:
+    """Every supported file under `folder` (recursively), refusing more than `max_files`."""
+    files: list[Path] = []
+    for file in folder.rglob("*"):
+        if file.is_file() and file.suffix.lower() in SUPPORTED_SUFFIXES:
+            files.append(file)
+            if len(files) > max_files:
+                raise IngestionError(f"More than {max_files:,} files under {folder}; ingest less")
+    return sorted(files)
+
+
+def load_path(path: str | Path, max_files: int = MAX_FILES) -> list[Document]:
     """Load one file, or every supported file under a directory (recursively)."""
     path = Path(path)
     if path.is_file():
@@ -75,7 +100,6 @@ def load_path(path: str | Path) -> list[Document]:
     if not path.exists():
         raise FileNotFoundError(path)
     docs: list[Document] = []
-    for file in sorted(path.rglob("*")):
-        if file.is_file() and file.suffix.lower() in SUPPORTED_SUFFIXES:
-            docs.extend(load_file(file))
+    for file in find_files(path, max_files):
+        docs.extend(load_file(file))
     return docs

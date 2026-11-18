@@ -3,13 +3,16 @@
 Every setting is prefixed with RAG_, e.g. RAG_CHUNK_SIZE=1000.
 Keeping config in one typed object means no magic strings scattered around
 the code, and tests can build a Settings(...) with whatever values they need.
+Pydantic validates every value when Settings is created, so a bad value
+(say RAG_TOP_K=0) fails immediately with a clear message instead of
+causing strange behaviour later. (Power of Ten rule 7: check inputs.)
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,33 +22,39 @@ class Settings(BaseSettings):
     )
 
     # Vector database
-    qdrant_url: str | None = None  # e.g. http://localhost:6333; None -> embedded mode
+    qdrant_url: str | None = None  # e.g. http://localhost:6333; None means embedded mode
     qdrant_path: str = "./qdrant_data"  # used only in embedded mode
-    collection: str = "documents"
+    collection: str = Field(default="documents", min_length=1)
 
     # Embeddings
     embedder: Literal["fastembed", "hashing"] = "fastembed"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
-    # Chunking (characters)
-    chunk_size: int = 800
-    chunk_overlap: int = 120
+    # Chunking, measured in characters
+    chunk_size: int = Field(default=800, ge=50, le=20_000)
+    chunk_overlap: int = Field(default=120, ge=0)
 
     # Retrieval
-    top_k: int = 5  # how many chunks to hand to the answerer
-    min_score: float = 0.0  # drop chunks less similar than this (0 = keep all)
+    top_k: int = Field(default=5, ge=1, le=100)  # how many chunks to hand to the answerer
+    min_score: float = Field(default=0.0, ge=-1.0, le=1.0)  # drop weaker chunks; 0 keeps all
 
     # Answering
     llm: Literal["claude", "extractive"] = "claude"
     llm_model: str = "claude-opus-5-5"
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
-    llm_max_tokens: int = 16000
+    llm_max_tokens: int = Field(default=16_000, ge=1, le=128_000)
     llm_fallbacks: bool = True  # let the API retry a declined request on a fallback model
 
     # Read from ANTHROPIC_API_KEY (environment or .env). SecretStr keeps the key
     # out of logs and tracebacks: printing it shows '**********'. When empty, the
     # Anthropic SDK falls back to its own lookup (env vars, `ant auth login`).
     anthropic_api_key: SecretStr | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+
+    @model_validator(mode="after")
+    def _overlap_fits_in_chunk(self) -> Settings:
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("RAG_CHUNK_OVERLAP must be smaller than RAG_CHUNK_SIZE")
+        return self
 
 
 def get_settings() -> Settings:

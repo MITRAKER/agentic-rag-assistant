@@ -1,0 +1,29 @@
+# Dependabot opens pull requests that update our dependencies, so fixes and
+# security patches arrive without anyone having to remember. Each update is a
+# normal PR: CI runs on it, and it's merged only if every check passes.
+version: 2
+updates:
+  # Python packages: the dev tools pinned in pyproject.toml, and the
+  # minimum versions of the runtime dependencies.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      python-packages:  # one PR a week for all of them, instead of one each
+        patterns: ["*"]
+    commit-message:
+      prefix: "build(deps)"
+
+  # The actions used by the workflows in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci(deps)"

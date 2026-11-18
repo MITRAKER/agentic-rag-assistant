@@ -20,7 +20,11 @@ def message(
     stop_reason: str = "end_turn",
     model: str = "claude-opus-5-5",
     stop_details: dict | None = None,
+    iterations: list[dict] | None = None,
 ) -> BetaMessage:
+    usage: dict[str, Any] = {"input_tokens": 1200, "output_tokens": 80}
+    if iterations is not None:
+        usage["iterations"] = iterations
     return BetaMessage.model_validate(
         {
             "id": "msg_test",
@@ -31,9 +35,22 @@ def message(
             "stop_reason": stop_reason,
             "stop_sequence": None,
             "stop_details": stop_details,
-            "usage": {"input_tokens": 1200, "output_tokens": 80},
+            "usage": usage,
         }
     )
+
+
+def iteration(kind: str, model: str) -> dict:
+    """One `usage.iterations` entry: "message" for an attempt, "fallback_message" when a
+    fallback model produced the response."""
+    return {
+        "type": kind,
+        "model": model,
+        "input_tokens": 1200,
+        "output_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
 
 
 def cited_text(text: str, index: int, quote: str) -> dict:
@@ -55,8 +72,25 @@ def cited_text(text: str, index: int, quote: str) -> dict:
     }
 
 
+class FakeStream:
+    """What `client.beta.messages.stream(...)` returns: a context manager whose
+    get_final_message() gives the finished response."""
+
+    def __init__(self, response: BetaMessage):
+        self.response = response
+
+    def __enter__(self) -> FakeStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def get_final_message(self) -> BetaMessage:
+        return self.response
+
+
 class FakeClient:
-    """Mimics `anthropic.Anthropic()` just enough: client.beta.messages.create(**kwargs)."""
+    """Mimics `anthropic.Anthropic()` just enough: client.beta.messages.stream(**kwargs)."""
 
     def __init__(self, response: BetaMessage):
         self.response = response
@@ -64,6 +98,6 @@ class FakeClient:
         self.beta = self
         self.messages = self
 
-    def create(self, **kwargs: Any) -> BetaMessage:
+    def stream(self, **kwargs: Any) -> FakeStream:
         self.requests.append(kwargs)
-        return self.response
+        return FakeStream(self.response)

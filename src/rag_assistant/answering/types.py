@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from rag_assistant.ingestion.loaders import Metadata
 from rag_assistant.vectorstore import SearchHit
 
 
@@ -21,7 +22,7 @@ class Source:
     source: str  # file path the chunk came from
     title: str
     score: float  # cosine similarity to the question
-    metadata: dict = field(default_factory=dict)
+    metadata: Metadata = field(default_factory=dict)
 
     @classmethod
     def from_hit(cls, hit: SearchHit) -> Source:

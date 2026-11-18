@@ -1,0 +1,87 @@
+# pre-commit runs these checks on the files you are about to commit, and stops
+# the commit if one fails. CI runs exactly the same hooks on every pull request.
+#
+#   pre-commit install            # once per clone: run the hooks on every commit
+#   pre-commit run --all-files    # run them on the whole repository
+#
+# Every hook is "local": it calls a tool installed by `pip install -e ".[dev]"`.
+# The versions are pinned in one place (pyproject.toml), so your machine,
+# pre-commit and CI always run the very same checks.
+minimum_pre_commit_version: "4.0.0"
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      # ----------------------------------------------------- file hygiene ----
+      - id: trailing-whitespace
+        name: no trailing whitespace
+        entry: trailing-whitespace-fixer
+        args: [--markdown-linebreak-ext=md]
+        language: system
+        types: [text]
+      - id: end-of-file-fixer
+        name: files end with one newline
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
+      - id: mixed-line-ending
+        name: line endings are LF
+        entry: mixed-line-ending
+        args: [--fix=lf]
+        language: system
+        types: [text]
+      - id: check-merge-conflict
+        name: no merge-conflict markers
+        entry: check-merge-conflict
+        language: system
+        types: [text]
+      - id: check-added-large-files
+        name: no large files (over 500 KB)
+        entry: check-added-large-files
+        args: [--maxkb=500, --enforce-all]  # --enforce-all: CI checks every file, not just new ones
+        language: system
+      - id: check-yaml
+        name: YAML files parse
+        entry: check-yaml
+        language: system
+        types: [yaml]
+      - id: check-toml
+        name: TOML files parse
+        entry: check-toml
+        language: system
+        types: [toml]
+
+      # ---------------------------------------------------------- secrets ----
+      - id: detect-private-key
+        name: no private keys
+        entry: detect-private-key
+        language: system
+        types: [text]
+
+      # ----------------------------------------------------------- python ----
+      - id: ruff-check
+        name: ruff lint
+        entry: ruff check --fix --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format (also formats Python examples in Markdown)
+        entry: ruff format --force-exclude
+        language: system
+        types_or: [python, pyi, markdown]
+        require_serial: true
+      - id: mypy
+        name: mypy (strict types)
+        entry: mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
+      - id: power-of-ten
+        name: NASA/JPL Power of Ten rules
+        entry: python tools/power_of_ten.py src tools
+        language: system
+        types: [python]
+        pass_filenames: false

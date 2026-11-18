@@ -38,8 +38,24 @@ def test_prefers_paragraph_boundaries():
 
 
 def test_overlap_must_be_smaller_than_size():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="overlap"):
         split_text("x", chunk_size=10, overlap=10)
+
+
+def test_chunk_size_must_be_positive():
+    with pytest.raises(ValueError, match="chunk_size"):
+        split_text("x", chunk_size=0, overlap=0)
+
+
+def test_hard_cut_when_there_is_no_boundary():
+    assert split_text("x" * 25, chunk_size=10, overlap=0) == ["x" * 10, "x" * 10, "x" * 5]
+
+
+def test_overlap_starts_at_a_sentence_boundary():
+    text = "First sentence here. Second sentence follows. Third one ends it."
+    chunks = split_text(text, chunk_size=45, overlap=30)
+    assert len(chunks) > 1
+    assert all(c[0].isupper() for c in chunks)  # every chunk starts a sentence
 
 
 def test_chunk_ids_are_stable_and_unique():

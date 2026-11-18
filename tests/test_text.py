@@ -1,4 +1,4 @@
-from rag_assistant.text import split_sentences
+from rag_assistant.text import content_words, split_sentences
 
 
 def test_headings_and_sentences_are_separate_units():
@@ -41,3 +41,8 @@ def test_numbers_at_the_end_of_a_sentence_still_end_it():
         "The limit is 1000.",
         "Then it stops.",
     ]
+
+
+def test_content_words_keep_letters_from_any_script():
+    words = content_words("What is the café crème? Данные, chunk_size, 2024.")
+    assert words == ["café", "crème", "данные", "chunk", "size", "2024"]
