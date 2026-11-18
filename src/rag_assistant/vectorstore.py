@@ -96,13 +96,20 @@ class VectorStore:
             self.client.upsert(self.collection, points=points)
         return len(chunks)
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchHit]:
+    def search(self, query: str, top_k: int = 5, min_score: float = 0.0) -> list[SearchHit]:
+        """Return the `top_k` most similar chunks, best first.
+
+        `min_score` drops weak matches (cosine similarity below it). Nearest
+        neighbour search always returns *something*, even for a question your
+        documents know nothing about, so a threshold is a cheap first filter.
+        """
         if not self.client.collection_exists(self.collection):
             return []
         result = self.client.query_points(
             self.collection,
             query=self.embedder.embed_query(query),
             limit=top_k,
+            score_threshold=min_score if min_score > 0 else None,
             with_payload=True,
         )
         hits = []
