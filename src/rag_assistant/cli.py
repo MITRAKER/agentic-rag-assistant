@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, NoReturn
 import typer
 from pydantic import ValidationError
 
-from rag_assistant.answering import Answer, Source, answer_question, get_answerer
+from rag_assistant.answering import Answer, CheckResult, Source, answer_question, get_answerer
 from rag_assistant.config import Settings, get_settings
 from rag_assistant.embeddings import EmbeddingModelError, get_embedder
 from rag_assistant.ingestion import IngestionError, ingest_path
@@ -25,7 +25,6 @@ from rag_assistant.retrieval import RerankerModelError, Retriever, make_retrieve
 from rag_assistant.vectorstore import VectorStore, make_client
 
 if TYPE_CHECKING:
-    import anthropic
     from pydantic_core import ErrorDetails
 
 app = typer.Typer(help="Agentic RAG knowledge assistant", no_args_is_help=True)
@@ -138,12 +137,15 @@ def ask(
 
 
 def _answer(settings: Settings, question: str, top_k: int | None, agent: bool) -> Answer:
+    # The client comes first, so missing credentials fail before any model loads.
     if agent:
         from rag_assistant.agent import get_agent
+        from rag_assistant.answering.claude import client_from_settings
 
+        client = client_from_settings(settings)
         with _open_retriever(settings, top_k) as retriever:
-            return get_agent(settings, retriever).answer(question)
-    answerer = get_answerer(settings)  # first, so missing credentials fail before models load
+            return get_agent(settings, retriever, client).answer(question)
+    answerer = get_answerer(settings)
     with _open_retriever(settings, top_k) as retriever:
         return answer_question(question, retriever, answerer)
 
@@ -151,6 +153,8 @@ def _answer(settings: Settings, question: str, top_k: int | None, agent: bool) -
 def _explain_api_error(error: Exception, model: str) -> str:
     """A short, actionable message for an error raised by the Anthropic SDK."""
     import anthropic
+
+    from rag_assistant.answering.claude import api_error_detail
 
     # Most specific first, because the first matching class wins: for example,
     # APITimeoutError is a kind of APIConnectionError.
@@ -179,21 +183,8 @@ def _explain_api_error(error: Exception, model: str) -> str:
         if isinstance(error, kind):
             return message.format(model=model, error=error)
     if isinstance(error, anthropic.APIStatusError):
-        return f"Anthropic API error: {_status_error_detail(error)}"
+        return f"Anthropic API error: {api_error_detail(error)}"
     return f"Anthropic SDK error: {error}"
-
-
-def _status_error_detail(error: anthropic.APIStatusError) -> str:
-    """'overloaded_error: Overloaded', from the error body the API sends.
-
-    An error can also arrive in the middle of a streamed answer, after the
-    HTTP status 200 was sent, so the status code alone can mislead.
-    """
-    body = error.body if isinstance(error.body, dict) else {}
-    detail = body.get("error")
-    if isinstance(detail, dict) and "message" in detail:
-        return f"{detail.get('type', 'error')}: {detail['message']}"
-    return f"{error.message} (HTTP {error.status_code})"
 
 
 def _fail(message: str) -> NoReturn:
@@ -202,7 +193,9 @@ def _fail(message: str) -> NoReturn:
 
 
 def _print_answer(answer: Answer, verbose: bool) -> None:
-    typer.echo(answer.render())
+    rendered = answer.render()
+    if rendered:  # an agent that ran out of turns has no answer, only a warning
+        typer.echo(rendered)
     _print_warnings(answer)
     cited = answer.cited_source_indices()
     if cited:
@@ -234,14 +227,23 @@ def _print_warnings(answer: Answer) -> None:
         typer.secho("\n(The answer was cut off: raise RAG_LLM_MAX_TOKENS.)", fg="yellow")
     if answer.stop_reason in ("tool_use", "pause_turn"):
         typer.secho(
-            "\n(The agent used all RAG_AGENT_MAX_TURNS replies before it finished.)", fg="yellow"
+            "\n(The agent used all RAG_AGENT_MAX_TURNS replies before it could answer.)",
+            fg="yellow",
         )
     if answer.fallback_from:
         typer.secho(
             f"\n({answer.fallback_from} declined; answered by {answer.model}.)", fg="yellow"
         )
-    check = answer.check
-    if check and not check.passed:
+    if answer.check:
+        _print_check(answer.check, answer.complete)
+
+
+def _print_check(check: CheckResult, complete: bool) -> None:
+    if check.verdict == "skipped":
+        if complete:  # an unfinished answer already has a warning of its own
+            typer.secho(f"\n(Not self-checked: {check.feedback})", fg="yellow")
+        return
+    if not check.passed:
         typer.secho(f"\n(Self-check: {check.verdict.replace('_', ' ')}.", fg="yellow")
         for claim in check.unsupported_claims:
             typer.secho(f"  Not supported by its sources: {claim}", fg="yellow")

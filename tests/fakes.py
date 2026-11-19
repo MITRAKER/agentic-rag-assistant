@@ -112,7 +112,7 @@ class FakeClient:
 # client. Instead the real SDK talks to a mock HTTP transport that answers each
 # request with the next reply from a script, as a stream of server-sent events.
 
-Reply = str | Callable[[dict[str, Any]], str]
+Reply = str | httpx2.Response | Callable[[dict[str, Any]], str]
 
 
 def sse_reply(
@@ -165,6 +165,12 @@ def _block_events(index: int, block: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def api_error(status: int, kind: str, message: str) -> httpx2.Response:
+    """An error reply as the API sends it, e.g. api_error(529, "overloaded_error", "Overloaded")."""
+    body = {"type": "error", "error": {"type": kind, "message": message}}
+    return httpx2.Response(status, json=body)
+
+
 def tool_call(name: str, tool_input: dict[str, Any], call_id: str = "toolu_1") -> dict[str, Any]:
     return {"type": "tool_use", "id": call_id, "name": name, "input": tool_input}
 
@@ -189,7 +195,8 @@ class ScriptedAPI:
     """Plays the Anthropic API from a script of replies, with no network.
 
     A reply can be a function of the request, to answer with what it contains
-    (for example, to cite a search result our own tool produced).
+    (for example, to cite a search result our own tool produced), or an error
+    response (see api_error).
     """
 
     def __init__(self, *replies: Reply) -> None:
@@ -204,6 +211,8 @@ class ScriptedAPI:
         self.requests.append(body)
         self.betas.append(request.headers.get("anthropic-beta", ""))
         reply = self.replies.pop(0)
+        if isinstance(reply, httpx2.Response):
+            return reply
         content = reply(body) if callable(reply) else reply
         return httpx2.Response(200, headers={"content-type": "text/event-stream"}, text=content)
 

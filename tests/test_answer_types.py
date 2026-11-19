@@ -1,3 +1,5 @@
+import pytest
+
 from rag_assistant.answering import Answer, Citation, Segment, Source
 from rag_assistant.vectorstore import SearchHit
 
@@ -36,3 +38,20 @@ def test_source_from_hit_uses_title_and_page():
     src = Source.from_hit(hit)
     assert src.title == "report"  # no title metadata: falls back to the file name
     assert src.label == "report.pdf, page 4"
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "refused", "words", "complete"),
+    [
+        ("end_turn", False, "Qdrant uses HNSW.", True),
+        (None, False, "An extractive answer.", True),
+        ("max_tokens", False, "Qdrant uses HN", False),
+        ("tool_use", False, "Let me search.", False),
+        ("pause_turn", False, "", False),
+        ("refusal", True, "The model declined to answer this question.", False),
+        ("end_turn", False, "  ", False),
+    ],
+)
+def test_complete_means_a_finished_answer_with_text(stop_reason, refused, words, complete):
+    answer = Answer("q", [Segment(words)], [], stop_reason=stop_reason, refused=refused)
+    assert answer.complete is complete

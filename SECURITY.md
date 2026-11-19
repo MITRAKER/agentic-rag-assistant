@@ -29,6 +29,9 @@ For example:
   outside the folder it was asked to ingest, or run commands. (Prompt injection
   that only changes the wording of an answer is a quality bug: please open a
   normal issue.)
+- Document or web page content that makes the agent (`rag ask --agent`) send
+  data from your documents to a site the attacker chose, for example through
+  web fetch.
 - A crafted PDF, HTML or Markdown file that crashes ingestion or exhausts
   memory in spite of the file-size and file-count limits.
 - A dependency with a known vulnerability that our checks missed.

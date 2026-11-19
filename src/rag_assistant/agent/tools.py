@@ -49,9 +49,9 @@ def document_search_tool(
 ) -> BetaFunctionTool[Any]:
     """The search_documents tool, bound to one question's evidence, budget and trace."""
 
-    # eager_input_streaming: the requests are streamed, so let the tool input stream
-    # too. @beta_tool validates the input against the signature before running it.
-    @beta_tool(eager_input_streaming=True)
+    # No eager_input_streaming: with it the API stops checking that the input is valid
+    # JSON, and one short string gains nothing from arriving early.
+    @beta_tool
     def search_documents(query: str) -> BetaFunctionToolResultType:
         """Search the user's own documents: their notes, reports and other files.
 
@@ -96,7 +96,7 @@ def package_lookup_tool(
 ) -> BetaFunctionTool[Any]:
     """The lookup_python_package tool. Tests pass a mock `transport` instead of the internet."""
 
-    @beta_tool(eager_input_streaming=True)
+    @beta_tool
     def lookup_python_package(name: str) -> BetaFunctionToolResultType:
         """Look up a Python package on PyPI, the Python Package Index.
 
@@ -187,18 +187,22 @@ def package_source(data: dict[str, Any]) -> Source:
 
 
 def web_tools(max_uses: int) -> list[BetaToolUnionParam]:
-    """Web search and web fetch. Anthropic runs them; the API bills each use."""
+    """Web search and web fetch, which Anthropic's servers run.
+
+    Each search is billed; a fetch costs only the input tokens of what it reads.
+    """
     return [
         {"type": "web_search_20260209", "name": "web_search", "max_uses": max_uses},
         {
             "type": "web_fetch_20260209",
             "name": "web_fetch",
             "max_uses": max_uses,
-            "max_content_tokens": 10_000,  # long pages are cut, to bound the cost
+            "max_content_tokens": 10_000,  # cuts long pages (roughly); PDFs aren't capped
             "citations": {"enabled": True},
-            # Fetch only URLs the user typed or web search found. A URL planted in a
-            # document or in a fetched page can't be fetched, so text hidden there
-            # can't send the agent, with your data in the URL, to a site of its choice.
+            # Web fetch opens only URLs that already appeared in the conversation, and
+            # url_sources narrows those to the user's messages and web search results.
+            # A link planted in a document or a fetched page can't be followed, and our
+            # own user message (the revision request) has its links removed.
             "url_sources": {
                 "user_input": {"type": "all"},
                 "client_tool_results": {"type": "none"},

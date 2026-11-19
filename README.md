@@ -72,7 +72,7 @@ AGENT      rag ask --agent "question"
                 ▼ answers, with citations
              self-check: a second model reads each statement next to its passages
                 ├─ supported ─► done
-                └─ not supported ─► its feedback goes back to Claude, which revises
+                └─ not supported ─► the flagged statements go back to Claude, which revises
 
            Limits per attempt: RAG_AGENT_MAX_TURNS replies, RAG_AGENT_TOOL_BUDGET uses of each tool
 ```

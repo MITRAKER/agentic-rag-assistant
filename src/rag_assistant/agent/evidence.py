@@ -131,7 +131,7 @@ class ToolBudget:
             # ToolError becomes an error tool_result: the model reads this and
             # answers with what it has, instead of the loop crashing.
             raise ToolError(
-                f"{tool} has reached its limit of {self.limit} uses for this question. "
+                f"{tool} has reached its limit of {self.limit} uses. "
                 "Answer with the evidence you already have."
             )
         self._used[tool] = used + 1

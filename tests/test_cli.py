@@ -204,6 +204,19 @@ def test_the_agent_needs_claude(offline_env):
     assert "The agent needs Claude" in result.output
 
 
+def ask_agent(monkeypatch, answer, *options):
+    """Run `rag ask --agent` with an agent that gives `answer`."""
+
+    class FakeAgent:
+        def answer(self, question):
+            return answer
+
+    monkeypatch.setenv("RAG_LLM", "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("rag_assistant.agent.get_agent", lambda *args: FakeAgent())
+    return runner.invoke(app, ["ask", "--agent", *options, "q"])
+
+
 def test_ask_agent_shows_steps_sources_and_a_failed_check(offline_env, monkeypatch):
     from rag_assistant.answering import CheckResult, Citation, Source, Step
 
@@ -236,13 +249,7 @@ def test_ask_agent_shows_steps_sources_and_a_failed_check(offline_env, monkeypat
         check=CheckResult("partly_supported", ["It is the fastest."], "Remove the speed claim."),
     )
 
-    class FakeAgent:
-        def answer(self, question):
-            return answer
-
-    monkeypatch.setenv("RAG_LLM", "claude")
-    monkeypatch.setattr("rag_assistant.agent.get_agent", lambda settings, retrieve: FakeAgent())
-    result = runner.invoke(app, ["ask", "--agent", "-v", "q"])
+    result = ask_agent(monkeypatch, answer, "-v")
     assert result.exit_code == 0, result.output
     out = result.output
     assert "Qdrant uses HNSW, a graph. [1][2] The latest client is 1.20.0. [3]" in out
@@ -253,6 +260,40 @@ def test_ask_agent_shows_steps_sources_and_a_failed_check(offline_env, monkeypat
     assert "(Self-check: partly supported." in out
     assert "Not supported by its sources: It is the fastest." in out
     assert "Remove the speed claim.)" in out
+
+
+def test_ask_agent_says_when_the_answer_was_not_checked(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult
+
+    note = "The request to claude-haiku-5-5 failed: overloaded_error: Overloaded"
+    answer = Answer("q", [Segment("Qdrant uses HNSW.")], [], stop_reason="end_turn")
+    answer.check = CheckResult("skipped", feedback=note)
+    result = ask_agent(monkeypatch, answer)
+    assert result.exit_code == 0, result.output
+    assert result.output == f"Qdrant uses HNSW.\n\n(Not self-checked: {note})\n"
+
+
+def test_ask_agent_without_an_answer_shows_only_why(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult
+
+    answer = Answer("q", [], [], stop_reason="pause_turn")
+    answer.check = CheckResult("skipped", feedback="Nothing to check: the answer is incomplete.")
+    result = ask_agent(monkeypatch, answer)
+    assert result.exit_code == 0, result.output
+    assert result.output == (
+        "\n(The agent used all RAG_AGENT_MAX_TURNS replies before it could answer.)\n"
+    )
+
+
+def test_ask_agent_checks_credentials_before_loading_models(offline_env, monkeypatch):
+    def no_models(*args, **kwargs):
+        raise AssertionError("the retrieval models loaded before the credentials were checked")
+
+    monkeypatch.setenv("RAG_LLM", "claude")  # conftest.py removed every ANTHROPIC_* variable
+    monkeypatch.setattr("rag_assistant.cli._open_retriever", no_models)
+    result = runner.invoke(app, ["ask", "--agent", "anything"])
+    assert result.exit_code == 1
+    assert "ANTHROPIC_API_KEY" in result.output
 
 
 def test_ask_warns_when_the_agent_runs_out_of_turns(offline_env, monkeypatch):

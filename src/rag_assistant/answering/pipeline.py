@@ -34,11 +34,10 @@ def get_answerer(settings: Settings) -> Answerer:
 
         return ExtractiveAnswerer()
 
-    from rag_assistant.answering.claude import ClaudeAnswerer, make_client
+    from rag_assistant.answering.claude import ClaudeAnswerer, client_from_settings
 
-    key = settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else ""
     return ClaudeAnswerer(
-        make_client(key or None),
+        client_from_settings(settings),
         model=settings.llm_model,
         effort=settings.llm_effort,
         max_tokens=settings.llm_max_tokens,

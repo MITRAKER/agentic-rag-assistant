@@ -19,7 +19,8 @@ Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
   prints the steps the agent took.
 - A self-check. A second, smaller model reads each statement of the answer
   next to the passages it cites and returns a verdict in a fixed JSON shape.
-  When the answer isn't supported, the agent revises it with that feedback.
+  When the answer isn't supported, the agent revises the statements it
+  flagged. A check that can't run is reported, and the answer is kept.
 - Reranking. Vector search fetches more candidates than it needs
   (`RAG_RERANK_CANDIDATES`, 20 by default) and a reranker keeps the best
   `RAG_TOP_K`: a local cross-encoder (ms-marco-MiniLM-L-6-v2 through
@@ -31,9 +32,12 @@ Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
   `RAG_AGENT_TOOL_BUDGET`, `RAG_AGENT_WEB`, `RAG_AGENT_PYPI`,
   `RAG_AGENT_SELF_CHECK`, `RAG_AGENT_CHECK_MODEL` and `RAG_AGENT_RETRIES`.
   See [.env.example](.env.example).
-- Safety limits for the agent: a per-question cap on replies and on uses of
-  each tool, a fixed host, name check, timeout and 5 MB reply cap for PyPI,
-  and web fetch restricted to URLs the user typed or web search found.
+- Safety limits for the agent: caps on replies and on uses of each tool for
+  each attempt, and on revisions; a fixed host, name check, timeout and 5 MB
+  reply cap for PyPI; and web fetch limited to links from the user's messages
+  and web search results, never links in documents or fetched pages. The
+  revision request quotes only the agent's own statements, with links
+  removed, so a planted link can't become fetchable that way either.
 
 ### Changed
 

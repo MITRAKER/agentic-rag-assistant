@@ -22,8 +22,10 @@ from rag_assistant.answering.types import Answer, Citation, Segment, Source
 from rag_assistant.text import split_sentences
 
 if TYPE_CHECKING:
-    from anthropic import Anthropic
+    from anthropic import Anthropic, APIError
     from anthropic.types.beta import BetaMessage, BetaSearchResultBlockParam
+
+    from rag_assistant.config import Settings
 
 SYSTEM_PROMPT = """\
 You answer questions using the search results in the user's message. They are \
@@ -66,6 +68,26 @@ def make_client(api_key: str | None = None) -> Anthropic:
             ".env file (see .env.example), or run with RAG_LLM=extractive to answer offline."
         )
     return client
+
+
+def client_from_settings(settings: Settings) -> Anthropic:
+    """make_client() with the key from the settings, if they have one."""
+    key = settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else ""
+    return make_client(key or None)
+
+
+def api_error_detail(error: APIError) -> str:
+    """'overloaded_error: Overloaded', from the error body the API sends, else the SDK's message.
+
+    An error can also arrive in the middle of a streamed answer, after the
+    HTTP status 200 was sent, so the status code alone can mislead.
+    """
+    body = error.body if isinstance(error.body, dict) else {}
+    detail = body.get("error")
+    if isinstance(detail, dict) and "message" in detail:
+        return f"{detail.get('type', 'error')}: {detail['message']}"
+    status = getattr(error, "status_code", None)
+    return f"{error.message} (HTTP {status})" if status else error.message
 
 
 def search_result_block(src: Source, source: str | None = None) -> BetaSearchResultBlockParam:

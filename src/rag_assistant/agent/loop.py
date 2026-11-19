@@ -19,12 +19,13 @@ tool, and `retries` revisions.
 
 The whole question runs on one message thread. The API keeps the conversation
 between requests, so each request sends only what is new (a tool result, the
-checker's feedback) and a revision sees everything the first attempt found.
+self-check's findings) and a revision sees everything the first attempt found.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -33,14 +34,25 @@ from anthropic import omit
 from rag_assistant.agent.check import SelfChecker
 from rag_assistant.agent.evidence import Evidence, ToolBudget
 from rag_assistant.agent.tools import document_search_tool, package_lookup_tool, web_tools
-from rag_assistant.answering.claude import FALLBACK_BETA, declined_model, mark_refused
+from rag_assistant.answering.claude import (
+    FALLBACK_BETA,
+    client_from_settings,
+    declined_model,
+    mark_refused,
+)
 from rag_assistant.answering.types import Answer, CheckResult, Citation, Segment, Source, Step
 
 if TYPE_CHECKING:
     import httpx2
     from anthropic import Anthropic
     from anthropic.lib.threads import BetaMessageThread
-    from anthropic.types.beta import BetaMessage, BetaTextBlock
+    from anthropic.types.beta import (
+        BetaContentBlock,
+        BetaMessage,
+        BetaTextBlock,
+        BetaWebFetchToolResultBlock,
+        BetaWebSearchToolResultBlock,
+    )
 
     from rag_assistant.config import Effort, Settings
 
@@ -50,8 +62,8 @@ collection, and use other sources only when the documents aren't enough.
 
 Your tools:
 {tools}
-- Each tool has a limited number of uses per question. When a tool says its limit is \
-reached, answer with the evidence you have.
+- Each tool can be used only a few times. When a tool says its limit is reached, \
+answer with the evidence you have.
 
 How to answer:
 - Base every factual statement on what your tools returned. Citations are attached \
@@ -79,6 +91,12 @@ PYPI_LINE = (
     "its latest version."
 )
 MAX_FEEDBACK_CLAIMS = 10
+# Anything that could be a link: with a scheme, starting "www.", a host with a path,
+# or a bare host name such as data.evil.example (file names like notes.md match too).
+_LINK = re.compile(
+    r"[a-z][a-z0-9+.-]*://\S*|www\.\S+|[\w-]+(?:\.[\w-]+)+/\S*|(?:[\w-]+\.)+[^\W\d_]{2,}\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -133,16 +151,20 @@ class _Run:
     steps: list[Step] = field(default_factory=list)
     input_tokens: int = 0  # cached tokens included: everything the model read
     output_tokens: int = 0
-    fallback_from: str | None = None
+    last_model: str | None = None  # the model that wrote the latest reply
+    web_steps: dict[str, Step] = field(default_factory=dict)  # web calls awaiting a result
 
     def record(self, message: BetaMessage, requested_model: str) -> None:
         usage = message.usage
         cached = (usage.cache_creation_input_tokens or 0) + (usage.cache_read_input_tokens or 0)
         self.input_tokens += usage.input_tokens + cached
         self.output_tokens += usage.output_tokens
-        self.fallback_from = self.fallback_from or declined_model(message, requested_model)
+        declined = declined_model(message, requested_model)
+        if declined and message.model != self.last_model:  # traced once each time it switches
+            self.steps.append(Step("fallback", declined, f"{message.model} replied instead"))
+        self.last_model = message.model
         self.evidence.record_fetches(message)
-        self.steps.extend(server_tool_steps(message))
+        trace_server_tools(message.content, self.steps, self.web_steps)
 
 
 class ClaudeAgent:
@@ -174,8 +196,14 @@ class ClaudeAgent:
             if answer.check.passed or attempt == self.config.retries:
                 break
             budget.reset()  # a revision may need to search again
-            thread.append({"role": "user", "content": revision_request(answer.check)})
-            answer = self._attempt(thread, run, question)
+            thread.append({"role": "user", "content": revision_request(answer.check, answer.text)})
+            revised = self._attempt(thread, run, question)
+            if not revised.complete:  # out of turns, cut off or refused: keep the checked answer
+                why = revised.stop_reason or ""
+                run.steps.append(Step("revision", why, "unfinished; kept the checked answer"))
+                break
+            answer = revised
+        answer.input_tokens, answer.output_tokens = run.input_tokens, run.output_tokens
         return answer
 
     def _start_thread(self, run: _Run, budget: ToolBudget) -> BetaMessageThread[Any]:
@@ -208,32 +236,43 @@ class ClaudeAgent:
     def _attempt(self, thread: BetaMessageThread[Any], run: _Run, question: str) -> Answer:
         # Streaming keeps long replies safe from idle-connection timeouts (see step 2).
         runner = thread.tool_runner(max_iterations=self.config.max_turns, stream=True)
-        last: BetaMessage | None = None
+        turn: list[BetaMessage] = []  # the replies that make up the latest turn
         for stream in runner:  # one item per model reply; tools run in between
-            last = stream.get_final_message()
-            run.record(last, self.config.model)
-        if last is None:  # pragma: no cover - max_turns >= 1 always gives one reply
+            reply = stream.get_final_message()
+            run.record(reply, self.config.model)
+            # The API can pause a long turn (pause_turn); the next reply continues it.
+            paused = bool(turn) and turn[-1].stop_reason == "pause_turn"
+            turn = [*turn, reply] if paused else [reply]
+        if not turn:  # pragma: no cover - max_turns >= 1 always gives one reply
             raise RuntimeError("The agent's loop ended without a reply from the model.")
-        return build_answer(last, question, run)
+        return build_answer(turn, question, run, self.config.model)
 
 
-def build_answer(message: BetaMessage, question: str, run: _Run) -> Answer:
-    """The final reply as an Answer whose citations point into the run's evidence."""
+def build_answer(
+    turn: Sequence[BetaMessage], question: str, run: _Run, requested_model: str
+) -> Answer:
+    """The final turn as an Answer whose citations point into the run's evidence.
+
+    A turn is one reply, or several when the API paused it: then their content joins up.
+    """
+    last = turn[-1]
     answer = Answer(
         question=question,
         segments=[],
         sources=run.evidence.sources,
-        model=message.model,
-        stop_reason=message.stop_reason,
-        fallback_from=run.fallback_from,
+        model=last.model,
+        stop_reason=last.stop_reason,
+        fallback_from=declined_model(last, requested_model),
         input_tokens=run.input_tokens,
         output_tokens=run.output_tokens,
         steps=run.steps,
     )
-    if message.stop_reason == "refusal":
-        return mark_refused(answer, message)
+    if last.stop_reason == "refusal":
+        return mark_refused(answer, last)
+    if last.stop_reason in ("tool_use", "pause_turn"):
+        return answer  # out of turns in the middle of a search: there is no answer yet
     previous = -1
-    for position, block in answer_blocks(message):
+    for position, block in answer_blocks([block for reply in turn for block in reply.content]):
         text = block.text
         if previous >= 0 and position > previous + 1:
             # Something was left out in between (a web search, a remark before it),
@@ -251,8 +290,8 @@ def build_answer(message: BetaMessage, question: str, run: _Run) -> Answer:
     return answer
 
 
-def answer_blocks(message: BetaMessage) -> list[tuple[int, BetaTextBlock]]:
-    """The text blocks that answer, each with its position in the reply.
+def answer_blocks(content: Sequence[BetaContentBlock]) -> list[tuple[int, BetaTextBlock]]:
+    """The text blocks that answer, each with its position in `content` (a reply, or a turn).
 
     In a reply that searches the web, Claude often writes a line before it
     searches ("Let me look that up."). That line isn't part of the answer, so
@@ -261,66 +300,87 @@ def answer_blocks(message: BetaMessage) -> list[tuple[int, BetaTextBlock]]:
     from anthropic.types.beta import BetaTextBlock
 
     start = 0
-    for i, block in enumerate(message.content):
+    for i, block in enumerate(content):
         if block.type == "server_tool_use" or block.type.endswith("tool_result"):
             start = i + 1
     return [
         (i, block)
-        for i, block in enumerate(message.content)
+        for i, block in enumerate(content)
         if isinstance(block, BetaTextBlock) and (i >= start or block.citations)
     ]
 
 
-def server_tool_steps(message: BetaMessage) -> list[Step]:
-    """Trace entries for the web searches and fetches that Anthropic's servers ran."""
+def trace_server_tools(
+    content: Sequence[BetaContentBlock], steps: list[Step], waiting: dict[str, Step]
+) -> None:
+    """Add a step for each web search or fetch that Anthropic's servers ran.
+
+    A step's outcome is filled in when its result arrives: usually in the same
+    reply, but in the next one when the API paused the turn (pause_turn). So the
+    steps still `waiting` for a result carry over from one reply to the next.
+    """
     from anthropic.types.beta import (
         BetaServerToolUseBlock,
-        BetaWebFetchBlock,
         BetaWebFetchToolResultBlock,
         BetaWebSearchToolResultBlock,
     )
 
-    outcomes: dict[str, str] = {}
-    for block in message.content:
-        if isinstance(block, BetaWebSearchToolResultBlock):
-            found = block.content
-            outcomes[block.tool_use_id] = (
-                f"{len(found)} result(s)"
-                if isinstance(found, list)
-                else f"error: {found.error_code}"
-            )
-        elif isinstance(block, BetaWebFetchToolResultBlock):
-            page = block.content
-            outcomes[block.tool_use_id] = (
-                "page read" if isinstance(page, BetaWebFetchBlock) else f"error: {page.error_code}"
-            )
-    steps = []
-    for block in message.content:
+    for block in content:
         if isinstance(block, BetaServerToolUseBlock) and block.name in ("web_search", "web_fetch"):
             target = block.input.get("query") or block.input.get("url") or ""
-            steps.append(Step(block.name, str(target), outcomes.get(block.id, "no result")))
-    return steps
+            waiting[block.id] = Step(block.name, str(target), "no result")
+            steps.append(waiting[block.id])
+        elif isinstance(block, BetaWebSearchToolResultBlock | BetaWebFetchToolResultBlock):
+            step = waiting.pop(block.tool_use_id, None)
+            if step is not None:
+                step.outcome = _outcome(block)
 
 
-def revision_request(check: CheckResult) -> str:
-    """The message that asks for a revision, built from the self-check's findings."""
+def _outcome(block: BetaWebSearchToolResultBlock | BetaWebFetchToolResultBlock) -> str:
+    from anthropic.types.beta import BetaWebFetchBlock, BetaWebSearchToolResultBlock
+
+    if isinstance(block, BetaWebSearchToolResultBlock):
+        found = block.content
+        if isinstance(found, list):
+            return f"{len(found)} result(s)"
+        return f"error: {found.error_code}"
+    page = block.content
+    return "page read" if isinstance(page, BetaWebFetchBlock) else f"error: {page.error_code}"
+
+
+def revision_request(check: CheckResult, answer_text: str) -> str:
+    """The message that asks for a revision, built from the self-check's findings.
+
+    It goes on the thread as a user message. The model reads a user message as the
+    user's own words, and web_fetch may open any link in one (url_sources.user_input).
+    So it quotes only statements from the agent's own answer, with links removed, and
+    leaves out the checker's free-text note: the checker read untrusted passages, so
+    its note could carry a planted link or instruction.
+    """
+    written = _flat(answer_text)
+    claims = [flat for c in check.unsupported_claims if (flat := _flat(c)) and flat in written]
     lines = [f"An automated reviewer checked your answer against its sources: {check.verdict}."]
-    if check.unsupported_claims:
-        lines.append("Statements the cited passages don't support:")
-        lines.extend(f"- {claim}" for claim in check.unsupported_claims[:MAX_FEEDBACK_CLAIMS])
-    if check.feedback:
-        lines.append(f"Reviewer's note: {check.feedback}")
+    if claims:
+        lines.append("Statements in your answer that the cited passages don't support:")
+        lines.extend(f"- {_LINK.sub('[link removed]', c)}" for c in claims[:MAX_FEEDBACK_CLAIMS])
     lines.append(
-        "Write the whole answer again. Search for evidence where it is missing, and remove "
-        "or qualify any statement you can't support."
+        "Your tool limits have been reset. Write the whole answer again: search for evidence "
+        "where it is missing, and remove or qualify any statement you can't support."
     )
     return "\n".join(lines)
 
 
-def get_agent(settings: Settings, retrieve: Callable[[str], list[Source]]) -> ClaudeAgent:
-    from rag_assistant.answering.claude import make_client
+def _flat(text: str) -> str:
+    """`text` with each run of whitespace made one space, so line breaks don't matter."""
+    return " ".join(text.split())
 
-    key = settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else ""
-    client = make_client(key or None)
+
+def get_agent(
+    settings: Settings,
+    retrieve: Callable[[str], list[Source]],
+    client: Anthropic | None = None,
+) -> ClaudeAgent:
+    """The agent the settings describe. The CLI passes a `client` it made earlier."""
+    client = client or client_from_settings(settings)
     checker = SelfChecker(client, settings.agent_check_model) if settings.agent_self_check else None
     return ClaudeAgent(client, retrieve, AgentConfig.from_settings(settings), checker)

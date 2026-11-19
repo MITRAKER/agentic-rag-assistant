@@ -107,6 +107,12 @@ class Answer:
         """True when the model hit max_tokens, so the answer stops mid-way."""
         return self.stop_reason == "max_tokens"
 
+    @property
+    def complete(self) -> bool:
+        """False for a refusal, a cut-off reply, an agent that ran out of turns, or no text."""
+        unfinished = self.stop_reason in ("max_tokens", "tool_use", "pause_turn")
+        return not (self.refused or unfinished or not self.text)
+
     def cited_source_indices(self) -> list[int]:
         """Indices of cited sources, in the order they are first cited."""
         order: list[int] = []
