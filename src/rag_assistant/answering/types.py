@@ -87,7 +87,7 @@ class CheckResult:
 class Answer:
     question: str
     segments: list[Segment]
-    sources: list[Source]  # everything retrieved, in retrieval order
+    sources: list[Source]  # what the answer can cite, in the order it was found
     model: str | None = None  # model that wrote the answer ("extractive" offline)
     stop_reason: str | None = None
     refused: bool = False

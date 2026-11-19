@@ -182,36 +182,54 @@ def test_web_search_results_become_cited_web_sources(store):
     assert answer.steps == [Step("web_search", "qdrant hnsw", "1 result(s)")]
 
 
-def test_web_fetch_citations_point_to_the_page_url(store):
-    fetch = {
-        "type": "server_tool_use",
-        "id": "srvtoolu_2",
-        "name": "web_fetch",
-        "input": {"url": "https://example.com/hnsw"},
+def fetched_page(n: int, url: str, title: str | None, body: str) -> list[dict]:
+    """A web_fetch call and its result, as they appear in a reply."""
+    document: dict = {
+        "type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": body},
     }
-    fetched = {
-        "type": "web_fetch_tool_result",
-        "tool_use_id": "srvtoolu_2",
-        "content": {
-            "type": "web_fetch_result",
-            "url": "https://example.com/hnsw",
-            "retrieved_at": "2026-11-17T10:00:00Z",
+    if title is not None:
+        document["title"] = title
+    return [
+        {
+            "type": "server_tool_use",
+            "id": f"srvtoolu_{n}",
+            "name": "web_fetch",
+            "input": {"url": url},
+        },
+        {
+            "type": "web_fetch_tool_result",
+            "tool_use_id": f"srvtoolu_{n}",
             "content": {
-                "type": "document",
-                "title": "HNSW explained",
-                "source": {"type": "text", "media_type": "text/plain", "data": "HNSW is a graph."},
+                "type": "web_fetch_result",
+                "url": url,
+                "retrieved_at": "2026-11-17T10:00:00Z",
+                "content": document,
             },
         },
-    }
-    cite = {
+    ]
+
+
+def fetch_citation(quote: str, title: str | None, index: int = 0) -> dict:
+    """A citation of a fetched page. It names the page by its title, never by its URL."""
+    citation: dict = {
         "type": "char_location",
-        "cited_text": "HNSW is a graph.",
-        "document_index": 0,
-        "document_title": "HNSW explained",
+        "cited_text": quote,
+        "document_index": index,
         "start_char_index": 0,
-        "end_char_index": 16,
+        "end_char_index": len(quote),
     }
-    api = ScriptedAPI(sse_reply("msg_1", [fetch, fetched, text("HNSW is a graph.", cite)]))
+    if title is not None:
+        citation["document_title"] = title
+    return citation
+
+
+def test_web_fetch_citations_point_to_the_page_url(store):
+    reply = [
+        *fetched_page(2, "https://example.com/hnsw", "HNSW explained", "HNSW is a graph."),
+        text("HNSW is a graph.", fetch_citation("HNSW is a graph.", "HNSW explained")),
+    ]
+    api = ScriptedAPI(sse_reply("msg_1", reply))
     answer = ClaudeAgent(api.client(), Retriever(store)).answer("Summarize example.com/hnsw")
 
     [page] = answer.sources
@@ -221,6 +239,68 @@ def test_web_fetch_citations_point_to_the_page_url(store):
         "web",
     )
     assert answer.steps == [Step("web_fetch", "https://example.com/hnsw", "page read")]
+
+
+@pytest.mark.parametrize("title", ["Installation", None])
+def test_fetched_pages_that_share_a_title_or_have_none_stay_apart(store, title):
+    reply = [
+        *fetched_page(1, "https://a.example/install", title, "Install A with pip."),
+        *fetched_page(2, "https://b.example/install", title, "Install B with conda."),
+        text("A installs with pip.", fetch_citation("Install A with pip.", title)),
+        text(" B installs with conda.", fetch_citation("Install B with conda.", title, 1)),
+    ]
+    api = ScriptedAPI(sse_reply("msg_1", reply))
+    answer = ClaudeAgent(api.client(), Retriever(store), AgentConfig(pypi=False)).answer("q")
+
+    # The quoted text tells the pages apart, and each keeps its own URL.
+    assert [s.source for s in answer.sources] == [
+        "https://a.example/install",
+        "https://b.example/install",
+    ]
+    assert answer.render() == "A installs with pip. [1] B installs with conda. [2]"
+
+
+def test_a_citation_of_a_page_no_tool_fetched_is_dropped(store):
+    reply = [text("Made up.", fetch_citation("Made up.", "Never fetched"))]
+    api = ScriptedAPI(sse_reply("msg_1", reply))
+    answer = ClaudeAgent(api.client(), Retriever(store), AgentConfig(pypi=False)).answer("q")
+    assert answer.sources == []
+    assert answer.render() == "Made up."
+
+
+def test_cited_text_written_before_a_web_search_stays_in_the_answer(store):
+    second_search = {**WEB_SEARCH, "id": "srvtoolu_3", "input": {"query": "qdrant-client"}}
+    second_results = {
+        **WEB_RESULTS,
+        "tool_use_id": "srvtoolu_3",
+        "content": [{**WEB_RESULTS["content"][0], "url": "https://pypi.org/p/qdrant-client"}],
+    }
+    second_citation = {
+        **WEB_CITATION,
+        "url": "https://pypi.org/p/qdrant-client",
+        "cited_text": "qdrant-client 1.20.0",
+    }
+    reply = [
+        WEB_SEARCH,
+        WEB_RESULTS,
+        text("Qdrant builds an HNSW graph.", WEB_CITATION),
+        text(" Let me check the client too."),
+        second_search,
+        second_results,
+        text(" The latest client is 1.20.0.", second_citation),
+    ]
+    api = ScriptedAPI(sse_reply("msg_1", reply))
+    answer = ClaudeAgent(api.client(), Retriever(store), AgentConfig(pypi=False)).answer("q")
+
+    # The cited statement survives, the remark before the search doesn't, and the
+    # part after the search starts a new paragraph.
+    assert answer.render() == (
+        "Qdrant builds an HNSW graph. [1]\n\nThe latest client is 1.20.0. [2]"
+    )
+    assert [s.source for s in answer.sources] == [
+        "https://qdrant.tech/hnsw",
+        "https://pypi.org/p/qdrant-client",
+    ]
 
 
 def test_server_tool_errors_appear_in_the_trace():

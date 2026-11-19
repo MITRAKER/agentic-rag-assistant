@@ -813,7 +813,7 @@ caught and fixed before you read it.
 |------|-----|
 | `src/rag_assistant/retrieval.py` | Two-stage retrieval: vector search, then a reranker (cross-encoder or lexical) |
 | `src/rag_assistant/agent/tools.py` | The agent's tools: your documents, the PyPI API, web search and web fetch |
-| `src/rag_assistant/agent/evidence.py` | Tracks every source the agent saw, so citations lead back to it; per-tool budgets |
+| `src/rag_assistant/agent/evidence.py` | Tracks what the answer can cite (passages, PyPI results, web pages), so each citation leads back to its source; per-tool budgets |
 | `src/rag_assistant/agent/loop.py` | The agent: Claude picks tools in a bounded loop, then revises if the check fails |
 | `src/rag_assistant/agent/check.py` | The self-check: a second model compares each statement with the passages it cites |
 | `tests/fakes.py` (`ScriptedAPI`) | Plays the Anthropic API offline, so the real SDK and its tool runner can be tested |
@@ -939,7 +939,11 @@ blocks as step 2, so the agent's answer quotes them exactly. Each chunk is
 sent with a unique `source` key, like `docs/report.pdf#page=3&chunk=2`, and
 every citation carries that key back. `Evidence` (in `agent/evidence.py`) keeps
 the key-to-chunk table, which is how `[1]` in the answer finds its chunk even
-when it came from the third search. Web citations carry their URL instead.
+when it came from the third search. A web search citation carries the page's
+URL. A citation of a page that `web_fetch` read doesn't: it names the page only
+by its title, and two pages can share a title (or have none). So `Evidence`
+remembers every page `web_fetch` returned and picks the one with that title
+whose text contains the quote.
 
 PyPI is our example of an **API tool**: live, structured data that no document
 holds. Swapping in your company's ticket system or a weather API means

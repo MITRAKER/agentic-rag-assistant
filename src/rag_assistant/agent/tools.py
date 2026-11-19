@@ -168,8 +168,10 @@ def package_source(data: dict[str, Any]) -> Source:
     uploads = sorted(str(f.get("upload_time_iso_8601", "")) for f in data.get("urls") or [])
     if uploads and uploads[0]:
         facts.append(f"Version {version} was released on {uploads[0][:10]}.")
-    if info.get("summary"):
-        facts.append(f"PyPI describes it as: {info['summary']}.")
+    summary = str(info.get("summary") or "").strip()
+    if summary:
+        end = "" if summary.endswith((".", "!", "?")) else "."  # no doubled full stop
+        facts.append(f"PyPI describes it as: {summary}{end}")
     if info.get("requires_python"):
         facts.append(f"It requires Python {info['requires_python']}.")
     vulnerabilities = [str(v.get("id", "?")) for v in data.get("vulnerabilities") or []]

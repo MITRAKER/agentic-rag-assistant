@@ -67,6 +67,38 @@ def test_package_lookup_reports_known_vulnerabilities():
     assert not any("released" in s for s in sentences)  # no files, no release date
 
 
+@pytest.mark.parametrize("summary", ["Python HTTP for Humans.", "  Python HTTP for Humans  "])
+def test_package_lookup_ends_the_summary_with_one_full_stop(summary):
+    data = {**PYPI_JSON, "info": {**PYPI_JSON["info"], "summary": summary}}
+    tool, _, _ = pypi_tool(lambda request: httpx2.Response(200, json=data))
+    [block] = tool.call({"name": "requests"})
+    sentences = [b["text"] for b in block["content"]]
+    assert "PyPI describes it as: Python HTTP for Humans." in sentences
+
+
+def test_a_web_page_never_merges_with_the_pypi_result_at_its_url():
+    tool, evidence, _ = pypi_tool(lambda request: httpx2.Response(200, json=PYPI_JSON))
+    tool.call({"name": "qdrant-client"})
+    page = "https://pypi.org/project/qdrant-client/"  # PyPI's own page, found by web search
+    reply = message(
+        [
+            text(
+                "Install it with pip.",
+                {
+                    "type": "web_search_result_location",
+                    "url": page,
+                    "title": "qdrant-client · PyPI",
+                    "encrypted_index": "x",
+                    "cited_text": "pip install qdrant-client",
+                },
+            )
+        ]
+    )
+    [citation] = reply.content[0].citations
+    assert evidence.resolve(citation) == 1
+    assert [(s.kind, s.source) for s in evidence.sources] == [("api", page), ("web", page)]
+
+
 def refuse_connection(request):
     raise httpx2.ConnectError("no network", request=request)
 
