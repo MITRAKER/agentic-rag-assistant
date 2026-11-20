@@ -22,7 +22,7 @@ its sources.
 - [x] **Step 1: Ingestion.** Load PDF, Markdown, text and HTML; recursive chunking with sentence-aligned overlap; local embeddings; Qdrant storage; idempotent re-ingest
 - [x] **Step 2: Answers with citations.** Claude with native `search_result` citations (sentence-level quotes), refusal and fallback handling, an offline extractive baseline, `rag ask`
 - [x] **Engineering standards.** CI/CD on GitHub Actions, the NASA/JPL Power of Ten rules adapted to Python, strict typing, security scanning, release automation
-- [ ] Step 3: Agentic layer (routing, ranking, self-check)
+- [x] **Step 3: Agentic layer.** `rag ask --agent`: Claude chooses its sources (your documents, the web, the PyPI API) in a bounded tool loop; a cross-encoder reranks retrieved chunks; a second model checks the answer against its citations and asks for a revision when it isn't supported
 - [ ] Step 4: Chat UI and Docker
 - [ ] Step 5: Evaluation
 
@@ -35,10 +35,11 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 rag ingest data/sample                 # first run downloads the embedding model (~130 MB)
-rag search "what is cosine similarity?"
+rag search "what is cosine similarity?"  # reranked (~80 MB model, once); --no-rerank to compare
 
 export ANTHROPIC_API_KEY=sk-ant-...    # or put it in .env
 rag ask "How does Qdrant find similar vectors quickly?" -v
+rag ask --agent "Which Qdrant index do my notes describe, and what is the latest qdrant-client?" -v
 RAG_LLM=extractive rag ask "..."       # offline, no API key needed
 
 rag stats
@@ -54,11 +55,30 @@ naming the variable.
 ```
 INDEXING   files ─► loaders ─► recursive chunker ─► embedder (bge-small) ─► Qdrant
                                                                               │
-QUERY      rag ask "question" ─► embed ─► top-k search ◄──────────────────────┘
-                                               │
-                                               ▼
-                     Claude (search_result blocks, citations on) ─► answer + [n] citations
+RETRIEVAL  query ─► embed ─► vector search, 20 candidates ◄───────────────────┘
+                 ─► cross-encoder reranker ─► the best top-k chunks
+
+PIPELINE   rag ask "question" ─► retrieval ─► Claude, citations on ─► answer + [n]
+
+AGENT      rag ask --agent "question"
+                │
+                ▼
+             Claude ◄──────────── tool results ─────────────┐
+                │                                           │
+                ├─ asks for a tool ─► search_documents ─────┤  (the retrieval above)
+                │                     lookup_python_package ┤  (the PyPI API)
+                │                     web_search, web_fetch ┘  (Anthropic runs these)
+                │
+                ▼ answers, with citations
+             self-check: a second model reads each statement next to its passages
+                ├─ supported ─► done
+                └─ not supported ─► the flagged statements go back to Claude, which revises
+
+           Limits per attempt: RAG_AGENT_MAX_TURNS replies, RAG_AGENT_TOOL_BUDGET uses of each tool
 ```
+
+The pipeline always retrieves once and answers. The agent decides for itself
+where to look, and how often, within hard limits.
 
 ## Quality and engineering standards
 
@@ -82,8 +102,8 @@ the details.
 ## Project layout
 
 ```
-src/rag_assistant/     the package: ingestion/, answering/, cli.py, config.py, ...
-tests/                 pytest suite (offline: in-memory Qdrant, fake Claude client)
+src/rag_assistant/     the package: ingestion/, retrieval.py, answering/, agent/, cli.py, ...
+tests/                 pytest suite (offline: in-memory Qdrant, a scripted Claude API)
 tools/                 power_of_ten.py (rule checker), release_notes.py
 data/sample/           three small Markdown documents to try things on
 .github/               CI, CodeQL and release workflows, Dependabot, templates
@@ -91,7 +111,7 @@ data/sample/           three small Markdown documents to try things on
 
 ## Tech stack
 
-Python · Claude API (Claude Opus 5.5, native citations) · Qdrant · fastembed (BAAI/bge-small-en-v1.5) · pypdf · BeautifulSoup · Typer · pydantic-settings · pytest · ruff · mypy · GitHub Actions · CodeQL
+Python · Claude API (Claude Opus 5.5 with native citations, tool runner, message threads, web search and fetch; Claude Haiku 5.5 with structured outputs for the self-check) · Qdrant · fastembed (BAAI/bge-small-en-v1.5 embeddings, ms-marco-MiniLM cross-encoder) · httpx2 · pypdf · BeautifulSoup · Typer · pydantic-settings · pytest · ruff · mypy · GitHub Actions · CodeQL
 
 ## Contributing and security
 

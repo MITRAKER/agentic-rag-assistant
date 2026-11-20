@@ -24,9 +24,11 @@ from rag_assistant.text import content_words
 class Embedder(Protocol):
     dim: int
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """One vector of length `dim` per text, in the same order."""
 
-    def embed_query(self, text: str) -> list[float]: ...
+    def embed_query(self, text: str) -> list[float]:
+        """The vector for a search query (some models embed queries differently)."""
 
 
 class EmbeddingModelError(RuntimeError):

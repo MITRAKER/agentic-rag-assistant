@@ -4,6 +4,7 @@ from rag_assistant.answering import NO_RESULTS, answer_question, get_answerer
 from rag_assistant.answering.extractive import ExtractiveAnswerer
 from rag_assistant.config import Settings
 from rag_assistant.ingestion import ingest_path
+from rag_assistant.retrieval import Retriever
 
 SAMPLE = Path(__file__).parent.parent / "data" / "sample"
 
@@ -19,7 +20,9 @@ class SpyAnswerer:
 
 def test_end_to_end_with_extractive_answerer(store):
     ingest_path(SAMPLE, store)
-    answer = answer_question("What does Qdrant use HNSW for?", store, ExtractiveAnswerer())
+    answer = answer_question(
+        "What does Qdrant use HNSW for?", Retriever(store), ExtractiveAnswerer()
+    )
     assert "HNSW" in answer.text
     cited = [answer.sources[i] for i in answer.cited_source_indices()]
     assert cited[0].source.endswith("vector-databases.md")
@@ -27,7 +30,7 @@ def test_end_to_end_with_extractive_answerer(store):
 
 def test_empty_store_returns_no_results_without_calling_the_model(store):
     spy = SpyAnswerer()
-    answer = answer_question("anything", store, spy)
+    answer = answer_question("anything", Retriever(store), spy)
     assert answer.text == NO_RESULTS
     assert spy.calls == 0
 
@@ -35,7 +38,7 @@ def test_empty_store_returns_no_results_without_calling_the_model(store):
 def test_min_score_filters_weak_matches(store):
     ingest_path(SAMPLE, store)
     spy = SpyAnswerer()
-    answer = answer_question("zzz qqq", store, spy, min_score=0.99)
+    answer = answer_question("zzz qqq", Retriever(store, min_score=0.99), spy)
     assert answer.text == NO_RESULTS
 
 
