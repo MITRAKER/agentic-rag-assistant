@@ -156,6 +156,18 @@ def test_ask_warns_about_cut_off_and_fallback_answers(offline_env, monkeypatch):
     assert "claude-opus-5-5 declined; answered by fallback-model" in result.output
 
 
+def test_ask_says_when_the_context_window_filled_up(offline_env, monkeypatch):
+    def full(question, retrieve, answerer):
+        stop = "model_context_window_exceeded"
+        return Answer(question, [Segment("Half an ans")], [], stop_reason=stop)
+
+    monkeypatch.setattr("rag_assistant.cli.answer_question", full)
+    result = runner.invoke(app, ["ask", "anything"])
+    assert result.exit_code == 0
+    assert "filled its context window" in result.output
+    assert "RAG_LLM_MAX_TOKENS" not in result.output  # more output tokens wouldn't help
+
+
 def test_ingest_reports_a_missing_path(offline_env):
     result = runner.invoke(app, ["ingest", "no/such/folder"])
     assert result.exit_code == 1

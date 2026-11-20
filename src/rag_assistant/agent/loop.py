@@ -25,10 +25,12 @@ self-check's findings) and a revision sees everything the first attempt found.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import anthropic
 from anthropic import omit
 
 from rag_assistant.agent.check import SelfChecker
@@ -36,6 +38,7 @@ from rag_assistant.agent.evidence import Evidence, ToolBudget
 from rag_assistant.agent.tools import document_search_tool, package_lookup_tool, web_tools
 from rag_assistant.answering.claude import (
     FALLBACK_BETA,
+    api_error_detail,
     client_from_settings,
     declined_model,
     mark_refused,
@@ -91,12 +94,17 @@ PYPI_LINE = (
     "its latest version."
 )
 MAX_FEEDBACK_CLAIMS = 10
-# Anything that could be a link: with a scheme, starting "www.", a host with a path,
-# or a bare host name such as data.evil.example (file names like notes.md match too).
-_LINK = re.compile(
-    r"[a-z][a-z0-9+.-]*://\S*|www\.\S+|[\w-]+(?:\.[\w-]+)+/\S*|(?:[\w-]+\.)+[^\W\d_]{2,}\b",
-    re.IGNORECASE,
+# Punctuation that may stand at either end of a quoted word. None of it is a letter or a
+# digit, or becomes one when the text is normalized (NFKC), so it can't spell a host name.
+_EDGES = (
+    "\"'()*,.:;!?[]{}<>`#$%&+~|"
+    "\u201c\u201d\u2018\u2019\u00ab\u00bb\u2039\u203a\u201e\u201a"  # quotation marks
+    "\u00bf\u00a1\u2026\u2013\u2014\u2212\u2192\u2190\u2022\u00b0"  # dashes, arrows, ...
 )
+# Words with dots inside that can't be a host: numbers such as 3.12, 1,000.50 or v2.0.1
+# (an IPv4 address has four parts), and abbreviations of single letters such as e.g.
+# or U.S. (every top-level domain is longer).
+_DOTTED = re.compile(r"[-v]?[0-9][0-9,]*(?:\.[0-9]+){0,2}|[A-Za-z](?:\.[A-Za-z])+")
 
 
 @dataclass(frozen=True)
@@ -197,7 +205,11 @@ class ClaudeAgent:
                 break
             budget.reset()  # a revision may need to search again
             thread.append({"role": "user", "content": revision_request(answer.check, answer.text)})
-            revised = self._attempt(thread, run, question)
+            try:
+                revised = self._attempt(thread, run, question)
+            except anthropic.APIError as e:  # overloaded, rate limited, ...: keep the answer
+                run.steps.append(Step("revision", "error", api_error_detail(e)))
+                break
             if not revised.complete:  # out of turns, cut off or refused: keep the checked answer
                 why = revised.stop_reason or ""
                 run.steps.append(Step("revision", why, "unfinished; kept the checked answer"))
@@ -256,13 +268,14 @@ def build_answer(
     A turn is one reply, or several when the API paused it: then their content joins up.
     """
     last = turn[-1]
+    declined = (declined_model(reply, requested_model) for reply in turn)
     answer = Answer(
         question=question,
         segments=[],
         sources=run.evidence.sources,
         model=last.model,
         stop_reason=last.stop_reason,
-        fallback_from=declined_model(last, requested_model),
+        fallback_from=next(filter(None, declined), None),  # in any reply of the turn
         input_tokens=run.input_tokens,
         output_tokens=run.output_tokens,
         steps=run.steps,
@@ -271,8 +284,11 @@ def build_answer(
         return mark_refused(answer, last)
     if last.stop_reason in ("tool_use", "pause_turn"):
         return answer  # out of turns in the middle of a search: there is no answer yet
+    # A fallback block marks where another model took over in mid-reply. Its text goes on
+    # from the text before the block, so the block is no gap between paragraphs.
+    content = [block for reply in turn for block in reply.content if block.type != "fallback"]
     previous = -1
-    for position, block in answer_blocks([block for reply in turn for block in reply.content]):
+    for position, block in answer_blocks(content):
         text = block.text
         if previous >= 0 and position > previous + 1:
             # Something was left out in between (a web search, a remark before it),
@@ -353,16 +369,20 @@ def revision_request(check: CheckResult, answer_text: str) -> str:
 
     It goes on the thread as a user message. The model reads a user message as the
     user's own words, and web_fetch may open any link in one (url_sources.user_input).
-    So it quotes only statements from the agent's own answer, with links removed, and
-    leaves out the checker's free-text note: the checker read untrusted passages, so
-    its note could carry a planted link or instruction.
+    So it quotes only statements from the agent's own answer, with every word that
+    could be part of a link left out, and never the checker's free-text note: the
+    checker read untrusted passages, so its note could carry a planted link or instruction.
     """
     written = _flat(answer_text)
     claims = [flat for c in check.unsupported_claims if (flat := _flat(c)) and flat in written]
+    listed = claims[:MAX_FEEDBACK_CLAIMS]
+    quoted = [_without_links(claim) for claim in listed]
     lines = [f"An automated reviewer checked your answer against its sources: {check.verdict}."]
-    if claims:
+    if quoted:
         lines.append("Statements in your answer that the cited passages don't support:")
-        lines.extend(f"- {_LINK.sub('[link removed]', c)}" for c in claims[:MAX_FEEDBACK_CLAIMS])
+        lines.extend(f"- {statement}" for statement in quoted)
+    if quoted != listed:
+        lines.append("Words that could be part of a link are shown as [\u2026].")
     lines.append(
         "Your tool limits have been reset. Write the whole answer again: search for evidence "
         "where it is missing, and remove or qualify any statement you can't support."
@@ -373,6 +393,33 @@ def revision_request(check: CheckResult, answer_text: str) -> str:
 def _flat(text: str) -> str:
     """`text` with each run of whitespace made one space, so line breaks don't matter."""
     return " ".join(text.split())
+
+
+def _without_links(statement: str) -> str:
+    """`statement` with each word that could be part of a link replaced by "[\u2026]".
+
+    An allowlist, not a pattern for links, because links come in too many spellings
+    (IP addresses, other scripts, look-alike dots). A word is kept as written only when,
+    inside the punctuation at its edges, it is letters, digits and joiners, or a dotted
+    number or abbreviation. A host name needs a dot between two labels, so none survives.
+    The check reads each character once, so its time grows in step with the text.
+    """
+    return " ".join(_quotable(word) for word in statement.split(" "))
+
+
+def _quotable(word: str) -> str:
+    """`word` as written if it can't be part of a link, otherwise with its core replaced."""
+    core = word.strip(_EDGES)
+    if all(map(_plain, core)) or _DOTTED.fullmatch(core):
+        return word
+    start = len(word) - len(word.lstrip(_EDGES))
+    return f"{word[:start]}[\u2026]{word[start + len(core) :]}"
+
+
+def _plain(char: str) -> bool:
+    """A letter, a combining mark, a decimal digit, or a joiner: - _ ' and \u2019."""
+    category = unicodedata.category(char)
+    return category[0] in "LM" or category == "Nd" or char in "-_'\u2019"
 
 
 def get_agent(

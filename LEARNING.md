@@ -354,7 +354,9 @@ in the order they're first cited.
   A stream sends events while the model works, so `RAG_LLM_MAX_TOKENS` can use
   the model's full 128,000.
 * **Stop reasons** tell you why the model stopped: `end_turn` (finished
-  normally), `max_tokens` (cut off), `refusal` (a safety system declined the
+  normally), `max_tokens` (cut off), `model_context_window_exceeded` (cut off
+  too: the input and the reply filled the model's context window, so raising
+  `max_tokens` won't help), `refusal` (a safety system declined the
   request). A refusal is a normal HTTP 200 response, so code must check for
   it; we drop any partial text and show the explanation.
 * **Fallbacks:** with `fallbacks="default"` (a beta feature), if the model
@@ -1033,8 +1035,9 @@ statement by statement.
   and asks for the whole answer again. The new answer is checked too. If it
   still fails after `RAG_AGENT_RETRIES` revisions, you get it with a warning
   listing the unsupported statements, instead of a confident-sounding answer.
-  A revision that doesn't finish (it runs out of turns, is cut off or is
-  refused) is dropped: you get the answer that was checked, and its warning.
+  A revision that doesn't finish (it runs out of turns, is cut off, is
+  refused, or its request fails because the API is overloaded) is dropped:
+  you get the answer that was checked, and its warning.
 
 This is the idea behind research systems like Self-RAG and Corrective RAG:
 generate, critique, retrieve again. An LLM judge can be wrong too, so step 5
@@ -1063,9 +1066,24 @@ code writes counts as the user's words.** The revision request (Concept 6) is
 one. If it quoted the checker, a link that a planted passage slipped into the
 answer, or into the checker's note, would become fetchable on the next
 attempt, data and all. So `revision_request()` quotes only the agent's own
-sentences, removes anything that looks like a link, and leaves the checker's
-note out. The same goes for instructions: the model trusts a user message more
-than a tool result, so text from a source must not be promoted into one.
+sentences, leaves the checker's note out, and shows every word that could be
+part of a link as `[…]`. The same goes for instructions: the model trusts a
+user message more than a tool result, so text from a source must not be
+promoted into one.
+
+How do you find "every word that could be part of a link"? Our first version
+used a regular expression for links, and a review found spellings it missed:
+`203.0.113.7:8080/x`, a soft hyphen or an accent before the dot, a domain in
+Devanagari, letters in circles that Unicode normalizes to `evil.com`. On long
+input it was slow, too (its time grew with the square of the length). So
+`_without_links()` turns the question around and lists what is *safe*: a word
+is quoted as written only if, inside the punctuation at its edges, it is
+letters, digits and joiners such as `-`, or a dotted number like `3.12` or an
+abbreviation like `e.g.`. A host name needs a dot between two labels, so no
+spelling of one gets through, and a test checks every Unicode character to
+make sure none of the allowed ones becomes a dot, colon or slash when the text
+is normalized. That is the general lesson for filtering untrusted text: list
+what is allowed, because you can't list every way to write what isn't.
 
 The last row is the most important design decision: **give an agent only the
 powers the task needs**. A read-only agent that is fooled produces a wrong
@@ -1127,8 +1145,9 @@ which is step 5.
    Remove `url_sources` from `web_tools()` and ask again: now the agent can
    follow it. That is the trade-off, since the setting blocks honest links
    too. Put it back, then read `revision_request()` in `agent/loop.py` and
-   explain why it removes links. (Don't put anything private in the
-   documents for this one.)
+   explain why it leaves out words that could be links. Then try to write a
+   link that gets through `_without_links()`; the tests list the spellings
+   we tried. (Don't put anything private in the documents for this one.)
 8. **Interview questions to practise:** *"What's the difference between a
    workflow and an agent?"*, *"How do you stop an agent from looping
    forever?"*, *"What is a cross-encoder, and why not use it for the whole

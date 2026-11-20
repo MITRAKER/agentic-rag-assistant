@@ -36,8 +36,9 @@ Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
   each attempt, and on revisions; a fixed host, name check, timeout and 5 MB
   reply cap for PyPI; and web fetch limited to links from the user's messages
   and web search results, never links in documents or fetched pages. The
-  revision request quotes only the agent's own statements, with links
-  removed, so a planted link can't become fetchable that way either.
+  revision request quotes only the agent's own statements, with every word
+  that could be part of a link left out, so a planted link can't become
+  fetchable that way either.
 
 ### Changed
 
@@ -47,6 +48,12 @@ Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
   of sources) instead of a vector store, `top_k` and `min_score`, and
   `rag_assistant.answering.retrieve()` is replaced by
   `rag_assistant.retrieval.Retriever`.
+
+### Fixed
+
+- An answer cut off because the model's context window filled up
+  (`model_context_window_exceeded`) is reported as cut off, with a hint of
+  its own. It used to be shown as if it were complete.
 
 ## [0.2.0] - 2026-11-17
 

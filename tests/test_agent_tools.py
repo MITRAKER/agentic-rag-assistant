@@ -267,6 +267,13 @@ def test_checker_skips_answers_that_are_incomplete():
         (message([text('{"verdict": "great"}')]), "skipped"),
         (message([text("")], stop_reason="refusal"), "skipped"),
         (message([text('{"verdict": "supp')], stop_reason="max_tokens"), "skipped"),
+        (
+            message(
+                [text('{"verdict": "supported", "unsupported_claims": [], "feedback": ""}')],
+                stop_reason="model_context_window_exceeded",
+            ),
+            "skipped",
+        ),
     ],
 )
 def test_parse_check_never_trusts_a_malformed_reply(response, verdict):

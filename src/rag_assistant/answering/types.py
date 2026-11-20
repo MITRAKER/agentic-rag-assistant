@@ -104,14 +104,14 @@ class Answer:
 
     @property
     def truncated(self) -> bool:
-        """True when the model hit max_tokens, so the answer stops mid-way."""
-        return self.stop_reason == "max_tokens"
+        """True when the answer stops mid-way: at max_tokens, or with the context window full."""
+        return self.stop_reason in ("max_tokens", "model_context_window_exceeded")
 
     @property
     def complete(self) -> bool:
         """False for a refusal, a cut-off reply, an agent that ran out of turns, or no text."""
-        unfinished = self.stop_reason in ("max_tokens", "tool_use", "pause_turn")
-        return not (self.refused or unfinished or not self.text)
+        out_of_turns = self.stop_reason in ("tool_use", "pause_turn")
+        return not (self.refused or self.truncated or out_of_turns or not self.text)
 
     def cited_source_indices(self) -> list[int]:
         """Indices of cited sources, in the order they are first cited."""

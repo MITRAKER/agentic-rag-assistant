@@ -223,8 +223,14 @@ def _print_answer(answer: Answer, verbose: bool) -> None:
 
 
 def _print_warnings(answer: Answer) -> None:
-    if answer.truncated:
+    if answer.stop_reason == "max_tokens":
         typer.secho("\n(The answer was cut off: raise RAG_LLM_MAX_TOKENS.)", fg="yellow")
+    if answer.stop_reason == "model_context_window_exceeded":
+        typer.secho(
+            "\n(The answer was cut off: what the model read filled its context window. "
+            "Ask a narrower question, or retrieve fewer chunks with --top-k.)",
+            fg="yellow",
+        )
     if answer.stop_reason in ("tool_use", "pause_turn"):
         typer.secho(
             "\n(The agent used all RAG_AGENT_MAX_TURNS replies before it could answer.)",

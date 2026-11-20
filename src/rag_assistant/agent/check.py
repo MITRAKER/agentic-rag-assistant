@@ -135,7 +135,7 @@ def parse_check(response: BetaMessage) -> CheckResult:
     """The checker's verdict. If it couldn't give one, the check is skipped, not failed."""
     from anthropic.types.beta import BetaTextBlock
 
-    if response.stop_reason in ("refusal", "max_tokens"):
+    if response.stop_reason in ("refusal", "max_tokens", "model_context_window_exceeded"):
         return CheckResult(
             "skipped", feedback=f"The checker stopped early ({response.stop_reason})."
         )

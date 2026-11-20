@@ -46,6 +46,7 @@ def test_source_from_hit_uses_title_and_page():
         ("end_turn", False, "Qdrant uses HNSW.", True),
         (None, False, "An extractive answer.", True),
         ("max_tokens", False, "Qdrant uses HN", False),
+        ("model_context_window_exceeded", False, "Qdrant uses HN", False),
         ("tool_use", False, "Let me search.", False),
         ("pause_turn", False, "", False),
         ("refusal", True, "The model declined to answer this question.", False),
@@ -55,3 +56,16 @@ def test_source_from_hit_uses_title_and_page():
 def test_complete_means_a_finished_answer_with_text(stop_reason, refused, words, complete):
     answer = Answer("q", [Segment(words)], [], stop_reason=stop_reason, refused=refused)
     assert answer.complete is complete
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "truncated"),
+    [
+        ("max_tokens", True),
+        ("model_context_window_exceeded", True),
+        ("end_turn", False),
+        ("tool_use", False),
+    ],
+)
+def test_truncated_means_the_reply_stopped_mid_way(stop_reason, truncated):
+    assert Answer("q", [Segment("Half")], [], stop_reason=stop_reason).truncated is truncated
