@@ -15,6 +15,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -37,13 +39,27 @@ class Settings(BaseSettings):
     # Retrieval
     top_k: int = Field(default=5, ge=1, le=100)  # how many chunks to hand to the answerer
     min_score: float = Field(default=0.0, ge=-1.0, le=1.0)  # drop weaker chunks; 0 keeps all
+    # Reranking: vector search fetches rerank_candidates chunks, the reranker keeps top_k.
+    # "auto" uses the cross-encoder with fastembed and the offline lexical reranker with hashing.
+    reranker: Literal["auto", "cross-encoder", "lexical", "none"] = "auto"
+    rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = Field(default=20, ge=1, le=200)
 
     # Answering
     llm: Literal["claude", "extractive"] = "claude"
     llm_model: str = "claude-opus-5-5"
-    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    llm_effort: Effort = "medium"
     llm_max_tokens: int = Field(default=16_000, ge=1, le=128_000)
     llm_fallbacks: bool = True  # let the API retry a declined request on a fallback model
+
+    # Agent (rag ask --agent): Claude chooses its own tools, within these limits
+    agent_max_turns: int = Field(default=8, ge=2, le=30)  # model replies per attempt, at most
+    agent_tool_budget: int = Field(default=4, ge=1, le=20)  # uses of each tool per attempt
+    agent_web: bool = True  # web search and fetch, which run on Anthropic's servers
+    agent_pypi: bool = True  # look up Python packages on PyPI: an example of an API tool
+    agent_self_check: bool = True  # a second model checks the answer against its sources
+    agent_check_model: str = "claude-haiku-5-5"  # small and fast: checking is a narrow task
+    agent_retries: int = Field(default=1, ge=0, le=3)  # revisions after a failed check
 
     # Read from ANTHROPIC_API_KEY (environment or .env). SecretStr keeps the key
     # out of logs and tracebacks: printing it shows '**********'. When empty, the

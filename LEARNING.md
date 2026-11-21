@@ -9,8 +9,8 @@ This file grows with the project. Each step explains **what** was built,
 | 1 | Ingestion: load, chunk, embed, store | ✅ done |
 | 2 | Answering questions with citations | ✅ done |
 | ⚙️ | [Engineering standards](#engineering-standards): CI/CD, NASA/JPL rules, security | ✅ done |
-| 3 | The agent: routing, ranking, self-checking | ⏳ next |
-| 4 | Chat UI and Docker | ⏳ |
+| 3 | [The agentic layer](#step-3-the-agentic-layer): routing, reranking, self-checking | ✅ done |
+| 4 | Chat UI and Docker | ⏳ next |
 | 5 | Evaluation and a resume-ready README | ⏳ |
 
 ---
@@ -352,9 +352,14 @@ in the order they're first cited.
   more than ten minutes to generate (above 21,333 tokens), because a
   connection that stays silent that long can be cut somewhere along the way.
   A stream sends events while the model works, so `RAG_LLM_MAX_TOKENS` can use
-  the model's full 128,000.
+  the model's full 128,000. One catch: if the connection breaks off in the
+  middle of a stream, the SDK passes on the HTTP library's own error
+  (`httpx2.RequestError`) rather than one of its API errors, so code that
+  streams has to catch both. The CLI does, and explains it in one line.
 * **Stop reasons** tell you why the model stopped: `end_turn` (finished
-  normally), `max_tokens` (cut off), `refusal` (a safety system declined the
+  normally), `max_tokens` (cut off), `model_context_window_exceeded` (cut off
+  too: the input and the reply filled the model's context window, so raising
+  `max_tokens` won't help), `refusal` (a safety system declined the
   request). A refusal is a normal HTTP 200 response, so code must check for
   it; we drop any partial text and show the explanation.
 * **Fallbacks:** with `fallbacks="default"` (a beta feature), if the model
@@ -796,3 +801,365 @@ language, a developer's `.env`) finds what nobody thought to test.
 Step 3 builds the agent: routing between your documents, the web and APIs,
 reranking the evidence, and checking its own answers. It's written to these
 standards from the start.
+
+---
+
+## Step 3: The agentic layer
+
+**Goal:** let the assistant decide *where* to look and *whether its answer
+holds up*. A question your documents answer should be answered from them. A
+question about something newer than your documents should reach the web or a
+live API. And an answer that claims more than its sources say should be
+caught and fixed before you read it.
+
+### What was built
+
+| File | Job |
+|------|-----|
+| `src/rag_assistant/retrieval.py` | Two-stage retrieval: vector search, then a reranker (cross-encoder or lexical) |
+| `src/rag_assistant/agent/tools.py` | The agent's tools: your documents, the PyPI API, web search and web fetch |
+| `src/rag_assistant/agent/evidence.py` | Tracks what the answer can cite (passages, PyPI results, web pages), so each citation leads back to its source; per-tool budgets |
+| `src/rag_assistant/agent/loop.py` | The agent: Claude picks tools in a bounded loop, then revises if the check fails |
+| `src/rag_assistant/agent/check.py` | The self-check: a second model compares each statement with the passages it cites |
+| `tests/fakes.py` (`ScriptedAPI`) | Plays the Anthropic API offline, so the real SDK and its tool runner can be tested |
+
+Try it:
+
+```bash
+rag search "Which index does Qdrant use?"            # now reranked: two scores per chunk
+rag search "Which index does Qdrant use?" --no-rerank  # the raw vector search order
+
+rag ask --agent "How does Qdrant find similar vectors quickly?" -v
+rag ask --agent "What's the latest version of qdrant-client, and what index does it use?" -v
+```
+
+The second question needs two sources: your documents know about the index,
+but only PyPI knows today's version. The output looks like this (illustrative:
+your wording, numbers and steps will differ):
+
+```
+Qdrant finds similar vectors with HNSW, a layered graph index that lets a
+search jump quickly towards the closest vectors. [1] According to PyPI, the
+latest version of qdrant-client is 1.20.0, released on 2026-10-22. [2]
+
+Sources:
+[1] vector-databases.md  (Vector Databases, similarity 0.78)
+[2] https://pypi.org/project/qdrant-client/  (PyPI: qdrant-client, API)
+...
+Steps:
+  1. search_documents "Qdrant similarity search index" -> 5 passage(s)
+  2. lookup_python_package "qdrant-client" -> version 1.20.0
+  3. self_check "claude-haiku-5-5" -> supported
+
+Model: claude-opus-5-5 | tokens in/out: 9120/412 | cited: 100% of the answer
+```
+
+### Concept 1: Retrieve wide, rerank narrow
+
+Vector search compares the question's embedding with each chunk's embedding.
+Both were computed *separately* (a **bi-encoder**), which is why it scales to
+millions of chunks: the chunk vectors are computed once, at ingestion. The
+price is precision. One vector can't hold everything an 800-character chunk
+says, and the question never "sees" the chunk it's compared with.
+
+A **cross-encoder** reads the question and one passage *together* and scores
+how well the passage answers the question. It's much more accurate and much
+too slow to run on every chunk. So retrieval now has two stages:
+
+```
+question -> vector search: the 20 closest chunks   (RAG_RERANK_CANDIDATES, high recall)
+         -> cross-encoder scores each (question, chunk) pair
+         -> keep the best 5                         (RAG_TOP_K, high precision)
+```
+
+The cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`, about 80 MB) runs locally
+through fastembed, like the embedding model. Its scores are raw model outputs
+("logits"): good for ordering, but not probabilities, so don't compare them
+across models.
+
+Offline, `LexicalReranker` stands in. It's a small version of **hybrid
+search**: it ranks the chunks a second time by how many of the question's
+keywords they contain, then merges the two rankings with **reciprocal rank
+fusion** (RRF): each chunk earns `1 / (60 + rank)` from each ranking, and the
+sums decide. RRF uses only positions, never raw scores, so it can merge a
+cosine similarity with a keyword count without calibrating one to the other.
+Keywords catch what embeddings blur: product names, error codes, version
+numbers.
+
+`RAG_RERANKER=auto` picks the cross-encoder when you use the real embedding
+model and the lexical reranker when you use the offline hashing embedder.
+
+### Concept 2: What makes it an agent
+
+A **workflow** runs steps that *your code* chose in advance: retrieve, then
+answer. That's what `rag ask` does, and for most questions it's the right
+tool: one request, predictable cost.
+
+An **agent** runs a loop in which *the model* chooses the next step:
+
+```
+question -> Claude -> asks for a tool? -- yes --> our code runs it -> result back to Claude
+              ^                                                            |
+              +------------------------------------------------------------+
+              no: the answer, with citations -> self-check -> passed: done
+                                                           -> failed: revise, check again
+```
+
+The simplest kind of agent is a **router**: classify the question once, then
+send it to one source. Our agent routes *inside* the loop instead. It can
+search your documents, see that they don't mention versions, call PyPI, and
+search again with better words, because it judges each result before the next
+step. A one-shot router decides before it has seen any evidence.
+
+The cost is predictability: an agent makes several model calls, and you don't
+know in advance how many. That's why it's opt-in (`--agent`), and why
+concept 4 exists.
+
+**Why not Claude Managed Agents?** Anthropic can also host the whole loop and
+a sandbox for the tools. Here the tools need your local Qdrant database and
+your files, and step 4 packages everything in one Docker image you run
+yourself, so we run the loop ourselves with the Messages API.
+
+### Concept 3: Tools are how the agent routes
+
+A tool is a name, a description and a JSON schema for its input. The model
+never runs anything: it *asks* for a tool call, and code runs it. There are two
+kinds:
+
+| Tool | Kind | Who runs it | What it returns |
+|------|------|-------------|-----------------|
+| `search_documents` | client tool | our code (Qdrant + reranker) | `search_result` blocks, citable |
+| `lookup_python_package` | client tool | our code (the PyPI JSON API) | one `search_result` block, citable |
+| `web_search` | server tool | Anthropic's servers | search results, citable |
+| `web_fetch` | server tool | Anthropic's servers | the page as a document, citable |
+
+**The description is the routing logic.** Read the docstring of
+`search_documents` in `agent/tools.py`: it says *when* to use the tool ("first,
+for every question"), not just what it does. The system prompt adds the
+priorities: documents first, the web only when they fall short. Change those
+sentences and the agent's choices change.
+
+**Citations survive the loop.** Our tools return the same `search_result`
+blocks as step 2, so the agent's answer quotes them exactly. Each chunk is
+sent with a unique `source` key, like `docs/report.pdf#page=3&chunk=2`, and
+every citation carries that key back. `Evidence` (in `agent/evidence.py`) keeps
+the key-to-chunk table, which is how `[1]` in the answer finds its chunk even
+when it came from the third search. A web search citation carries the page's
+URL. A citation of a page that `web_fetch` read doesn't: it names the page only
+by its title, and two pages can share a title (or have none). So `Evidence`
+remembers every page `web_fetch` returned and picks the one with that title
+whose text contains the quote.
+
+PyPI is our example of an **API tool**: live, structured data that no document
+holds. Swapping in your company's ticket system or a weather API means
+changing one function.
+
+### Concept 4: Limits the model can't argue with
+
+A loop controlled by a model must still end (Power of Ten rule 2). The
+prompt *asks* for restraint; the code *enforces* it:
+
+| Limit | Setting | Enforced by |
+|-------|---------|-------------|
+| Model replies per attempt | `RAG_AGENT_MAX_TURNS` (8) | the tool runner's `max_iterations` |
+| Uses of each client tool per attempt | `RAG_AGENT_TOOL_BUDGET` (4) | `ToolBudget`: one call too many gets an error result |
+| Web searches and fetches | the same budget | the server tools' `max_uses` (counted per request, so `max_turns` caps the total) |
+| Revisions after a failed check | `RAG_AGENT_RETRIES` (1) | a `for` loop with a fixed range |
+
+Look at what happens when a tool's budget runs out: `ToolBudget.spend()`
+raises `ToolError`, the SDK turns it into a `tool_result` with `is_error: true`,
+and the model reads "search_documents has reached its limit ... Answer with
+the evidence you already have." Errors that the model can read and recover
+from are much better than crashing the loop.
+
+The same idea covers bad input. `@beta_tool` checks every tool call against
+the function's signature before running it, and our tools check what a
+signature can't (an empty query, an invalid package name) and answer with an
+error the model can act on.
+
+### Concept 5: The SDK's tool runner and message threads
+
+We didn't write the loop by hand. `thread.tool_runner(...)` sends a request,
+runs the client tools the model asked for, sends their results back and
+repeats until the model answers. Each loop iteration hands us the reply, so
+`_attempt()` can count tokens and record the web searches in the trace.
+
+* **`@beta_tool`** turns a typed Python function into a tool: the docstring
+  becomes the description and the `Args:` section the parameter descriptions.
+  We create the tools inside a function (`document_search_tool(...)`) so each
+  question gets its own evidence, budget and trace.
+* **Eager input streaming stays off.** A client tool can stream its input as
+  the model writes it (`@beta_tool(eager_input_streaming=True)`), which pays
+  off when the input is long, a whole file say. The price: the API stops
+  checking that the input is valid JSON, and broken JSON makes the SDK raise
+  an error in the middle of the loop, which our code would have to catch and
+  retry. Our tools take one short string, so we'd gain nothing: it stays off.
+* **Message threads.** A question runs on one *thread*: the API keeps the
+  conversation between requests, so each request sends only what's new (a
+  tool result, the self-check's findings) instead of the whole history. The
+  tests show it: the first request has `"thread": {"type": "create"}`, the
+  next ones `"continue"`. A revision is just one more message on the same
+  thread, so it builds on everything the first attempt found. Threads are not
+  covered by zero data retention. If your organization relies on ZDR, run the
+  loop with `client.beta.messages.tool_runner(..., thread=False)` instead: it
+  sends the whole history with every request, and your code keeps the
+  messages so that a revision can add to them.
+* **Prompt caching.** Every request re-reads the instructions, the tools and
+  the conversation so far. A cache breakpoint on the system prompt plus the
+  top-level `cache_control` makes those repeats cheap. The token count that
+  `rag ask -v` prints includes cached tokens.
+
+### Concept 6: Self-checking
+
+Native citations prove that a quoted passage *exists*. They don't prove the
+passage *says what the answer claims*. "Qdrant uses HNSW [1]" can cite a
+sentence about cosine similarity. The self-check asks exactly that question,
+statement by statement.
+
+* **A second model.** The checker is Claude Haiku 5.5 by default
+  (`RAG_AGENT_CHECK_MODEL`): checking is a narrow comparison of text with text,
+  and a small model does it fast and cheaply. A model that didn't write the
+  answer also has no stake in defending it.
+* **Structured outputs.** The request sets `output_config.format` to a JSON
+  schema, so the reply is JSON of exactly our shape: a `verdict`
+  (`supported`, `partly_supported`, `unsupported` or `no_answer`), the
+  unsupported statements and feedback. We still validate it with pydantic
+  (`_CheckReply`), because "the API promises" is not a test. A reply that
+  doesn't parse makes the check `skipped`, never a false "supported".
+* **A check that can't run says so.** When the checker's reply doesn't parse,
+  its request fails (the model is overloaded, say, the connection breaks off,
+  or `RAG_AGENT_CHECK_MODEL` names a model your key can't use) or the answer
+  is unfinished, the check is `skipped`: you still get the answer, with a note
+  that it wasn't checked and why.
+* **An honest "I don't know" passes.** `no_answer` counts as a pass: an answer
+  that says the documents don't cover the question claims nothing unsupported.
+* **Revision.** When the check fails, a new message on the agent's thread
+  lists the statements the check flagged, gives the agent a fresh tool budget
+  and asks for the whole answer again. The new answer is checked too. If it
+  still fails after `RAG_AGENT_RETRIES` revisions, you get it with a warning
+  listing the unsupported statements, instead of a confident-sounding answer.
+  A revision that doesn't finish (it runs out of turns, is cut off, is
+  refused, or its request fails because the API is overloaded or the
+  connection breaks off) is dropped: you get the answer that was checked, and
+  its warning.
+
+This is the idea behind research systems like Self-RAG and Corrective RAG:
+generate, critique, retrieve again. An LLM judge can be wrong too, so step 5
+measures how often its verdicts agree with a human's.
+
+### Concept 7: Tools turn prompt injection into actions
+
+In step 2 a malicious document could, at worst, change the answer's text. An
+agent with tools can *do* things, so the same planted sentence could try to
+make it act. The dangerous combination, sometimes called the "lethal
+trifecta", is: access to private data, exposure to untrusted content, and a
+way to send data out. Our agent has all three (your documents, web pages, and
+tools that reach the internet), so each channel out is narrowed:
+
+| Channel | Risk | Defence here |
+|---------|------|--------------|
+| `web_fetch` | following a link planted in a document or a page: which link it picks can leak data, and the page can hold more planted text | web fetch opens only URLs already in the conversation, and `url_sources` narrows those to your messages and web search results, never links in documents or fetched pages |
+| `lookup_python_package` | data smuggled out in the request | a fixed host (pypi.org), a package-name pattern that rejects anything else, a timeout and a 5 MB response cap |
+| `web_search` | data smuggled out in a search query | the instructions to treat tool results as data; turn the web off with `RAG_AGENT_WEB=false` for sensitive collections |
+| everything | the model following planted instructions | no tool can change or delete anything: the agent can only read |
+
+What would web fetch do with `https://evil.example/?d=<your data>`, a URL the
+model fills in itself? Refuse it: that URL never appeared in the conversation.
+The rule has a gap that is easy to miss, though: **a user message your own
+code writes counts as the user's words.** The revision request (Concept 6) is
+one. If it quoted the checker, a link that a planted passage slipped into the
+answer, or into the checker's note, would become fetchable on the next
+attempt, data and all. So `revision_request()` quotes only the agent's own
+sentences, leaves the checker's note out, and shows every word that could be
+part of a link as `[…]`. The same goes for instructions: the model trusts a
+user message more than a tool result, so text from a source must not be
+promoted into one.
+
+How do you find "every word that could be part of a link"? Our first version
+used a regular expression for links, and a review found spellings it missed:
+`203.0.113.7:8080/x`, a soft hyphen or an accent before the dot, a domain in
+Devanagari, letters in circles that Unicode normalizes to `evil.com`. On long
+input it was slow, too (its time grew with the square of the length). So
+`_without_links()` turns the question around and lists what is *safe*: a word
+is quoted as written only if, inside the punctuation at its edges, it is
+letters, digits and joiners such as `-`, or a dotted number like `3.12` or an
+abbreviation like `e.g.`. A host name needs a dot between two labels, so no
+spelling of one gets through, and a test checks every Unicode character to
+make sure none of the allowed ones becomes a dot, colon or slash when the text
+is normalized. That is the general lesson for filtering untrusted text: list
+what is allowed, because you can't list every way to write what isn't.
+
+The last row is the most important design decision: **give an agent only the
+powers the task needs**. A read-only agent that is fooled produces a wrong
+answer, which the self-check may catch. An agent that can send email when
+fooled is a security incident.
+
+### Concept 8: Testing an agent without calling the API
+
+Step 2's tests replaced the client with a fake. That doesn't work here: the
+loop lives inside the SDK's tool runner, and that loop is exactly what we
+want to test. So `ScriptedAPI` (in `tests/fakes.py`) keeps the real SDK and
+replaces only the network: a mock HTTP transport answers each request with
+the next reply from a script, as the same stream of server-sent events the
+API sends.
+
+```python
+api = ScriptedAPI(
+    sse_reply("msg_1", [tool_call("search_documents", {"query": "HNSW index"})], "tool_use"),
+    answer_citing_the_first_result("Qdrant uses HNSW."),
+)
+answer = ClaudeAgent(api.client(), retriever).answer("What index does Qdrant use?")
+```
+
+A scripted reply can be a function of the request, which lets the second
+reply cite the chunk that our real search tool just returned. The tests then
+check both sides of every turn: what we sent (tools, thread, tool results)
+and what we made of the replies (citations, steps, verdicts). They can't tell
+you whether Claude *chooses well*: that needs real questions and real calls,
+which is step 5.
+
+### Exercises
+
+1. **Watch the reranker work.** With `RAG_EMBEDDER=hashing`, compare
+   `rag search "HNSW" --no-rerank` with `rag search "HNSW"`. Which chunks
+   moved, and why? Then write a question where keyword matching beats meaning
+   (a product code, say) and one where it loses.
+2. **Routing by description.** Change `search_documents`'s docstring to "Use
+   this only when the user mentions their files." Ask a question your
+   documents answer with `rag ask --agent -v`. Does the agent still search
+   them? Put the docstring back.
+3. **Budgets.** Run `RAG_AGENT_TOOL_BUDGET=1 rag ask --agent -v "..."` with a
+   question that needs two searches. Find the step where the budget ran out,
+   and read what the model did next.
+4. **Catch a hallucination.** Ask `rag ask --agent -v "When was Qdrant
+   founded, and by whom?"` (the sample documents don't say). Did the first
+   answer pass the check? With `RAG_AGENT_SELF_CHECK=false`, how does the
+   answer change?
+5. **Write an API tool.** Add `lookup_npm_package` using
+   `https://registry.npmjs.org/<name>`, modelled on `package_lookup_tool`:
+   validate the name, fix the host, cap the size, return one fact per
+   sentence, and test it with `httpx2.MockTransport`.
+6. **A router, for comparison.** Write a function that sends a question to
+   `web` if it contains "latest", "today" or "news", else to `documents`, and
+   run it on ten questions. Where does it fail where the agent succeeds?
+7. **Defence in depth.** Add a document with a complete link in it, such as
+   "The full release notes are at https://<your test domain>/notes-123." Ask
+   `rag ask --agent -v "What do the full release notes say?"` and read the
+   steps: web fetch won't open that link, because it came from a document.
+   Remove `url_sources` from `web_tools()` and ask again: now the agent can
+   follow it. That is the trade-off, since the setting blocks honest links
+   too. Put it back, then read `revision_request()` in `agent/loop.py` and
+   explain why it leaves out words that could be links. Then try to write a
+   link that gets through `_without_links()`; the tests list the spellings
+   we tried. (Don't put anything private in the documents for this one.)
+8. **Interview questions to practise:** *"What's the difference between a
+   workflow and an agent?"*, *"How do you stop an agent from looping
+   forever?"*, *"What is a cross-encoder, and why not use it for the whole
+   search?"* and *"How would an attacker exfiltrate data through a RAG
+   agent, and how do you stop it?"*
+
+### What's next
+
+Step 4 puts a chat interface on top, with the agent's steps visible as it
+works, and packages the assistant and Qdrant with Docker so it runs anywhere
+with one command.

@@ -22,8 +22,11 @@ from rag_assistant.answering.types import Answer, Citation, Segment, Source
 from rag_assistant.text import split_sentences
 
 if TYPE_CHECKING:
-    from anthropic import Anthropic
+    import httpx2
+    from anthropic import Anthropic, APIError
     from anthropic.types.beta import BetaMessage, BetaSearchResultBlockParam
+
+    from rag_assistant.config import Settings
 
 SYSTEM_PROMPT = """\
 You answer questions using the search results in the user's message. They are \
@@ -68,18 +71,52 @@ def make_client(api_key: str | None = None) -> Anthropic:
     return client
 
 
-def search_result_block(src: Source) -> BetaSearchResultBlockParam:
+def client_from_settings(settings: Settings) -> Anthropic:
+    """make_client() with the key from the settings, if they have one."""
+    key = settings.anthropic_api_key.get_secret_value() if settings.anthropic_api_key else ""
+    return make_client(key or None)
+
+
+def api_error_detail(error: APIError) -> str:
+    """'overloaded_error: Overloaded', from the error body the API sends, else the SDK's message.
+
+    An error can also arrive in the middle of a streamed answer, after the
+    HTTP status 200 was sent, so the status code alone can mislead.
+    """
+    body = error.body if isinstance(error.body, dict) else {}
+    detail = body.get("error")
+    if isinstance(detail, dict) and "message" in detail:
+        return f"{detail.get('type', 'error')}: {detail['message']}"
+    status = getattr(error, "status_code", None)
+    return f"{error.message} (HTTP {status})" if status else error.message
+
+
+def request_error_detail(error: APIError | httpx2.RequestError) -> str:
+    """What went wrong with a request to the API, in one line.
+
+    The SDK raises an APIError when a request fails, but a connection that breaks
+    off in the middle of a streamed reply reaches us as httpx2's own RequestError.
+    """
+    from anthropic import APIError
+
+    if isinstance(error, APIError):
+        return api_error_detail(error)
+    return f"the reply broke off ({type(error).__name__}: {error})"
+
+
+def search_result_block(src: Source, source: str | None = None) -> BetaSearchResultBlockParam:
     """Turn one retrieved chunk into a `search_result` content block.
 
     One text block per sentence gives finer citations: Claude cites whole
     blocks, so with one block per chunk every citation would quote the
-    entire chunk.
+    entire chunk. `source` overrides the block's source name; the agent
+    passes a unique key per chunk, so a citation leads back to its chunk.
     """
     sentences = split_sentences(src.text) or [src.text]
     page = src.metadata.get("page")
     return {
         "type": "search_result",
-        "source": f"{src.source}#page={page}" if page else src.source,
+        "source": source or (f"{src.source}#page={page}" if page else src.source),
         "title": f"{src.title} (page {page})" if page else src.title,
         "content": [{"type": "text", "text": s} for s in sentences],
         # Citations are all-or-nothing: every search result in a request must
@@ -146,11 +183,7 @@ def parse_response(
     response: BetaMessage, question: str, sources: list[Source], requested_model: str | None = None
 ) -> Answer:
     """Convert an API response into our own Answer type."""
-    from anthropic.types.beta import (
-        BetaCitationSearchResultLocation,
-        BetaFallbackBlock,
-        BetaTextBlock,
-    )
+    from anthropic.types.beta import BetaCitationSearchResultLocation, BetaTextBlock
 
     answer = Answer(
         question=question,
@@ -158,18 +191,15 @@ def parse_response(
         sources=sources,
         model=response.model,
         stop_reason=response.stop_reason,
+        fallback_from=declined_model(response, requested_model),
         input_tokens=response.usage.input_tokens,
         output_tokens=response.usage.output_tokens,
     )
     if response.stop_reason == "refusal":
-        return _refused(answer, response)
+        return mark_refused(answer, response)
 
     for block in response.content:
-        if isinstance(block, BetaFallbackBlock):
-            # The requested model declined; a fallback model wrote what follows.
-            # If several models declined in turn, the first block names ours.
-            answer.fallback_from = answer.fallback_from or block.from_.model
-        elif isinstance(block, BetaTextBlock):
+        if isinstance(block, BetaTextBlock):
             citations = [
                 Citation(source_index=c.search_result_index, cited_text=c.cited_text)
                 for c in block.citations or []
@@ -178,24 +208,28 @@ def parse_response(
             ]
             answer.segments.append(Segment(block.text, citations))
         # Other block types (e.g. "thinking") aren't part of the visible answer.
-    if answer.fallback_from is None and _served_by_fallback(response):
-        # "Sticky routing": for about an hour after a conversation falls back,
-        # the API sends it straight to the fallback model. Nothing declined
-        # this time, so there is no fallback block, only the usage entry.
-        answer.fallback_from = requested_model or "the requested model"
     return answer
 
 
-def _served_by_fallback(response: BetaMessage) -> bool:
-    """The documented signal that a fallback model wrote the response.
+def declined_model(response: BetaMessage, requested_model: str | None = None) -> str | None:
+    """The model that declined before a fallback model answered, or None if none did."""
+    from anthropic.types.beta import BetaFallbackBlock
 
-    `usage.iterations` lists every attempt; the one that produced the returned
-    message has the type "fallback_message" when it ran on a fallback model.
-    """
-    return any(item.type == "fallback_message" for item in response.usage.iterations or [])
+    for block in response.content:
+        if isinstance(block, BetaFallbackBlock):
+            # The requested model declined; a fallback model wrote what follows.
+            # If several models declined in turn, the first block names ours.
+            return block.from_.model
+    # "Sticky routing": for about an hour after a conversation falls back, the API
+    # sends it straight to the fallback model. Nothing declines then, so there is no
+    # fallback block. The documented signal is in `usage.iterations`: the attempt
+    # that produced the message has the type "fallback_message".
+    if any(item.type == "fallback_message" for item in response.usage.iterations or []):
+        return requested_model or "the requested model"
+    return None
 
 
-def _refused(answer: Answer, response: BetaMessage) -> Answer:
+def mark_refused(answer: Answer, response: BetaMessage) -> Answer:
     """A refusal is a normal HTTP 200 response. Any partial text is incomplete, so drop it."""
     reason = response.stop_details.explanation if response.stop_details else None
     message = "The model declined to answer this question."

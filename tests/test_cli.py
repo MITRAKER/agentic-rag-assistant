@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anthropic
+import httpx2
 import pytest
 from typer.testing import CliRunner
 
@@ -124,6 +125,10 @@ OVERLOADED = {"type": "error", "error": {"type": "overloaded_error", "message": 
         (status_error(anthropic.InternalServerError, 500), "Anthropic API error: boom (HTTP 500)"),
         (status_error(anthropic.APIStatusError, 200, OVERLOADED), "overloaded_error: Overloaded"),
         (anthropic.AnthropicError("odd"), "Anthropic SDK error: odd"),
+        (
+            httpx2.RemoteProtocolError("peer closed connection"),
+            "broke off before the answer finished (RemoteProtocolError)",
+        ),
     ],
 )
 def test_ask_explains_api_errors(offline_env, monkeypatch, error, message):
@@ -139,7 +144,7 @@ def test_ask_explains_api_errors(offline_env, monkeypatch, error, message):
 
 
 def test_ask_warns_about_cut_off_and_fallback_answers(offline_env, monkeypatch):
-    def cut_off(question, store, answerer, top_k, min_score):
+    def cut_off(question, retrieve, answerer):
         return Answer(
             question,
             [Segment("Half an ans")],
@@ -156,6 +161,18 @@ def test_ask_warns_about_cut_off_and_fallback_answers(offline_env, monkeypatch):
     assert "claude-opus-5-5 declined; answered by fallback-model" in result.output
 
 
+def test_ask_says_when_the_context_window_filled_up(offline_env, monkeypatch):
+    def full(question, retrieve, answerer):
+        stop = "model_context_window_exceeded"
+        return Answer(question, [Segment("Half an ans")], [], stop_reason=stop)
+
+    monkeypatch.setattr("rag_assistant.cli.answer_question", full)
+    result = runner.invoke(app, ["ask", "anything"])
+    assert result.exit_code == 0
+    assert "filled its context window" in result.output
+    assert "RAG_LLM_MAX_TOKENS" not in result.output  # more output tokens wouldn't help
+
+
 def test_ingest_reports_a_missing_path(offline_env):
     result = runner.invoke(app, ["ingest", "no/such/folder"])
     assert result.exit_code == 1
@@ -168,3 +185,138 @@ def test_ingest_reports_an_unsupported_file(offline_env, tmp_path):
     result = runner.invoke(app, ["ingest", str(notes)])
     assert result.exit_code == 1
     assert "Unsupported file type: notes.docx" in result.output
+
+
+def test_search_shows_rerank_scores_unless_told_not_to(offline_env):
+    assert runner.invoke(app, ["ingest", SAMPLE]).exit_code == 0
+    reranked = runner.invoke(app, ["search", "HNSW index", "-k", "2"])
+    assert reranked.exit_code == 0, reranked.output
+    assert "rerank" in reranked.output  # hashing embedder -> the lexical reranker
+    plain = runner.invoke(app, ["search", "HNSW index", "-k", "2", "--no-rerank"])
+    assert "rerank" not in plain.output
+    assert "[2]" in plain.output
+
+
+def test_explains_a_reranking_model_that_cannot_be_downloaded(offline_env, monkeypatch):
+    from types import ModuleType
+
+    def offline(model_name):
+        raise ValueError(f"Could not load model {model_name} from any source.")
+
+    module = ModuleType("fastembed.rerank.cross_encoder")
+    module.TextCrossEncoder = offline
+    monkeypatch.setitem(sys.modules, "fastembed", ModuleType("fastembed"))
+    monkeypatch.setitem(sys.modules, "fastembed.rerank", ModuleType("fastembed.rerank"))
+    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", module)
+    monkeypatch.setenv("RAG_RERANKER", "cross-encoder")
+    result = runner.invoke(app, ["search", "anything"])
+    assert result.exit_code == 1
+    assert "Couldn't load the reranking model" in result.output
+    assert "RAG_RERANKER=lexical" in result.output
+
+
+def test_the_agent_needs_claude(offline_env):
+    result = runner.invoke(app, ["ask", "--agent", "anything"])
+    assert result.exit_code == 1
+    assert "The agent needs Claude" in result.output
+
+
+def ask_agent(monkeypatch, answer, *options):
+    """Run `rag ask --agent` with an agent that gives `answer`."""
+
+    class FakeAgent:
+        def answer(self, question):
+            return answer
+
+    monkeypatch.setenv("RAG_LLM", "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("rag_assistant.agent.get_agent", lambda *args: FakeAgent())
+    return runner.invoke(app, ["ask", "--agent", *options, "q"])
+
+
+def test_ask_agent_shows_steps_sources_and_a_failed_check(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult, Citation, Source, Step
+
+    sources = [
+        Source("Qdrant uses HNSW.", "docs/v.md", "Vector", 0.81, {"chunk_index": 0}),
+        Source("HNSW is a graph.", "https://example.com/hnsw", "HNSW explained", 0.0, kind="web"),
+        Source(
+            "Latest is 1.20.0.", "https://pypi.org/project/qdrant-client/", "PyPI", 0.0, kind="api"
+        ),
+        Source("Unused chunk.", "docs/other.md", "Other", 0.42),
+    ]
+    answer = Answer(
+        "q",
+        [
+            Segment(
+                "Qdrant uses HNSW, a graph.",
+                [Citation(0, "Qdrant uses HNSW."), Citation(1, "HNSW is a graph.")],
+            ),
+            Segment(" The latest client is 1.20.0.", [Citation(2, "Latest is 1.20.0.")]),
+            Segment(" It is the fastest."),
+        ],
+        sources,
+        model="claude-opus-5-5",
+        stop_reason="end_turn",
+        steps=[
+            Step("search_documents", "HNSW", "2 passage(s)"),
+            Step("web_fetch", "https://example.com/hnsw", "page read"),
+            Step("self_check", "claude-haiku-5-5", "partly_supported"),
+        ],
+        check=CheckResult("partly_supported", ["It is the fastest."], "Remove the speed claim."),
+    )
+
+    result = ask_agent(monkeypatch, answer, "-v")
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Qdrant uses HNSW, a graph. [1][2] The latest client is 1.20.0. [3]" in out
+    assert "https://example.com/hnsw  (HNSW explained, web)" in out
+    assert "https://pypi.org/project/qdrant-client/  (PyPI, API)" in out
+    assert "other.md  (Other, similarity 0.42)" in out  # retrieved but not cited
+    assert '2. web_fetch "https://example.com/hnsw" -> page read' in out
+    assert "(Self-check: partly supported." in out
+    assert "Not supported by its sources: It is the fastest." in out
+    assert "Remove the speed claim.)" in out
+
+
+def test_ask_agent_says_when_the_answer_was_not_checked(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult
+
+    note = "The request to claude-haiku-5-5 failed: overloaded_error: Overloaded"
+    answer = Answer("q", [Segment("Qdrant uses HNSW.")], [], stop_reason="end_turn")
+    answer.check = CheckResult("skipped", feedback=note)
+    result = ask_agent(monkeypatch, answer)
+    assert result.exit_code == 0, result.output
+    assert result.output == f"Qdrant uses HNSW.\n\n(Not self-checked: {note})\n"
+
+
+def test_ask_agent_without_an_answer_shows_only_why(offline_env, monkeypatch):
+    from rag_assistant.answering import CheckResult
+
+    answer = Answer("q", [], [], stop_reason="pause_turn")
+    answer.check = CheckResult("skipped", feedback="Nothing to check: the answer is incomplete.")
+    result = ask_agent(monkeypatch, answer)
+    assert result.exit_code == 0, result.output
+    assert result.output == (
+        "\n(The agent used all RAG_AGENT_MAX_TURNS replies before it could answer.)\n"
+    )
+
+
+def test_ask_agent_checks_credentials_before_loading_models(offline_env, monkeypatch):
+    def no_models(*args, **kwargs):
+        raise AssertionError("the retrieval models loaded before the credentials were checked")
+
+    monkeypatch.setenv("RAG_LLM", "claude")  # conftest.py removed every ANTHROPIC_* variable
+    monkeypatch.setattr("rag_assistant.cli._open_retriever", no_models)
+    result = runner.invoke(app, ["ask", "--agent", "anything"])
+    assert result.exit_code == 1
+    assert "ANTHROPIC_API_KEY" in result.output
+
+
+def test_ask_warns_when_the_agent_runs_out_of_turns(offline_env, monkeypatch):
+    def stopped(question, retrieve, answerer):
+        return Answer(question, [Segment("Partial")], [], stop_reason="tool_use")
+
+    monkeypatch.setattr("rag_assistant.cli.answer_question", stopped)
+    result = runner.invoke(app, ["ask", "anything"])
+    assert "used all RAG_AGENT_MAX_TURNS replies" in result.output
