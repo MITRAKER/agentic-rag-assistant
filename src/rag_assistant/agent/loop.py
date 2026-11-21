@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import anthropic
+import httpx2
 from anthropic import omit
 
 from rag_assistant.agent.check import SelfChecker
@@ -38,15 +39,14 @@ from rag_assistant.agent.evidence import Evidence, ToolBudget
 from rag_assistant.agent.tools import document_search_tool, package_lookup_tool, web_tools
 from rag_assistant.answering.claude import (
     FALLBACK_BETA,
-    api_error_detail,
     client_from_settings,
     declined_model,
     mark_refused,
+    request_error_detail,
 )
 from rag_assistant.answering.types import Answer, CheckResult, Citation, Segment, Source, Step
 
 if TYPE_CHECKING:
-    import httpx2
     from anthropic import Anthropic
     from anthropic.lib.threads import BetaMessageThread
     from anthropic.types.beta import (
@@ -94,6 +94,8 @@ PYPI_LINE = (
     "its latest version."
 )
 MAX_FEEDBACK_CLAIMS = 10
+# Blocks that hold nothing the reader sees, and don't separate the text around them.
+_UNSEEN = ("fallback", "thinking", "redacted_thinking")
 # Punctuation that may stand at either end of a quoted word. None of it is a letter or a
 # digit, or becomes one when the text is normalized (NFKC), so it can't spell a host name.
 _EDGES = (
@@ -207,8 +209,8 @@ class ClaudeAgent:
             thread.append({"role": "user", "content": revision_request(answer.check, answer.text)})
             try:
                 revised = self._attempt(thread, run, question)
-            except anthropic.APIError as e:  # overloaded, rate limited, ...: keep the answer
-                run.steps.append(Step("revision", "error", api_error_detail(e)))
+            except (anthropic.APIError, httpx2.RequestError) as e:  # keep the checked answer
+                run.steps.append(Step("revision", "error", request_error_detail(e)))
                 break
             if not revised.complete:  # out of turns, cut off or refused: keep the checked answer
                 why = revised.stop_reason or ""
@@ -268,14 +270,14 @@ def build_answer(
     A turn is one reply, or several when the API paused it: then their content joins up.
     """
     last = turn[-1]
-    declined = (declined_model(reply, requested_model) for reply in turn)
+    model, declined = _authors(turn, requested_model)
     answer = Answer(
         question=question,
         segments=[],
         sources=run.evidence.sources,
-        model=last.model,
+        model=model,
         stop_reason=last.stop_reason,
-        fallback_from=next(filter(None, declined), None),  # in any reply of the turn
+        fallback_from=declined,
         input_tokens=run.input_tokens,
         output_tokens=run.output_tokens,
         steps=run.steps,
@@ -284,9 +286,9 @@ def build_answer(
         return mark_refused(answer, last)
     if last.stop_reason in ("tool_use", "pause_turn"):
         return answer  # out of turns in the middle of a search: there is no answer yet
-    # A fallback block marks where another model took over in mid-reply. Its text goes on
-    # from the text before the block, so the block is no gap between paragraphs.
-    content = [block for reply in turn for block in reply.content if block.type != "fallback"]
+    # A fallback block marks where another model took over in mid-reply, and its text goes
+    # on from the text before the block. Neither it nor thinking is a gap between paragraphs.
+    content = [block for reply in turn for block in reply.content if block.type not in _UNSEEN]
     previous = -1
     for position, block in answer_blocks(content):
         text = block.text
@@ -304,6 +306,19 @@ def build_answer(
         ]
         answer.segments.append(Segment(text, citations))
     return answer
+
+
+def _authors(turn: Sequence[BetaMessage], requested_model: str) -> tuple[str, str | None]:
+    """The model to name as the turn's author, and the model that declined, if one did.
+
+    If a fallback model wrote any reply of the turn, that model is named, so a warning
+    such as "X declined; answered by Y" never names the model that declined.
+    """
+    for reply in turn:
+        declined = declined_model(reply, requested_model)
+        if declined:
+            return reply.model, declined
+    return turn[-1].model, None
 
 
 def answer_blocks(content: Sequence[BetaContentBlock]) -> list[tuple[int, BetaTextBlock]]:

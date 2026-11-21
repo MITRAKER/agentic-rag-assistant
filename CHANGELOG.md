@@ -54,6 +54,9 @@ Step 3 of [LEARNING.md](LEARNING.md): the agentic layer.
 - An answer cut off because the model's context window filled up
   (`model_context_window_exceeded`) is reported as cut off, with a hint of
   its own. It used to be shown as if it were complete.
+- A connection that breaks off in the middle of a streamed answer is
+  explained in one line. It used to end `rag ask` with a traceback, because
+  the SDK passes that failure on as the HTTP library's error, not its own.
 
 ## [0.2.0] - 2026-11-17
 

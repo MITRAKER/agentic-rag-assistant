@@ -6,12 +6,15 @@ import time
 import unicodedata
 from pathlib import Path
 
+import httpx2
 import pytest
 
 from fakes import (
     Reply,
     ScriptedAPI,
     api_error,
+    broken_reply,
+    iteration,
     message,
     search_citation,
     sse_reply,
@@ -426,9 +429,17 @@ def test_a_fallback_that_writes_the_answer_is_reported(store):
     assert answer.steps == [Step("fallback", "claude-opus-5-5", "claude-opus-4-8 replied instead")]
 
 
-def test_a_fallback_in_mid_reply_goes_on_with_the_same_sentence(store):
+THINKING = {"type": "thinking", "thinking": "", "signature": "sig"}  # its text left out
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [[FALLBACK], [FALLBACK, THINKING], [THINKING, FALLBACK]],
+    ids=["fallback", "fallback, then thinking", "thinking, then fallback"],
+)
+def test_a_fallback_in_mid_reply_goes_on_with_the_same_sentence(store, boundary):
     # The declined model's text stays, and the fallback model continues it.
-    reply = [text("Qdrant builds"), FALLBACK, text(" an HNSW graph.")]
+    reply = [text("Qdrant builds"), *boundary, text(" an HNSW graph.")]
     api = ScriptedAPI(sse_reply("msg_1", reply, model="claude-opus-4-8"))
     answer = ClaudeAgent(api.client(), Retriever(store), OFFLINE).answer("q")
     assert answer.render() == "Qdrant builds an HNSW graph."
@@ -446,6 +457,19 @@ def test_a_fallback_in_a_paused_reply_is_reported_on_the_answer(store):
     )
     answer = ClaudeAgent(api.client(), Retriever(store), AgentConfig(pypi=False)).answer("q")
     assert answer.render() == "Qdrant builds an HNSW graph. [1]"
+    assert (answer.model, answer.fallback_from) == ("claude-opus-4-8", "claude-opus-5-5")
+
+
+def test_a_turn_a_fallback_model_helped_write_names_that_model(store):
+    # The first reply of the turn came from the fallback model (sticky routing: no
+    # fallback block), and the requested model wrote the rest.
+    sticky = [iteration("fallback_message", "claude-opus-4-8")]
+    api = ScriptedAPI(
+        sse_reply("msg_1", [WEB_SEARCH], "pause_turn", "claude-opus-4-8", iterations=sticky),
+        sse_reply("msg_2", [WEB_RESULTS, text("Qdrant builds an HNSW graph.", WEB_CITATION)]),
+    )
+    answer = ClaudeAgent(api.client(), Retriever(store), AgentConfig(pypi=False)).answer("q")
+    # Not "claude-opus-5-5 declined; answered by claude-opus-5-5".
     assert (answer.model, answer.fallback_from) == ("claude-opus-4-8", "claude-opus-5-5")
 
 
@@ -559,20 +583,36 @@ def test_an_unfinished_revision_keeps_the_checked_answer(store, revision, stop_r
     assert (answer.input_tokens, answer.output_tokens) == (2000, 100)
 
 
-def test_a_revision_the_api_rejects_keeps_the_checked_answer(store):
+@pytest.mark.parametrize(
+    ("failure", "detail"),
+    [
+        (api_error(529, "overloaded_error", "Overloaded"), "overloaded_error: Overloaded"),
+        # The SDK passes on a connection that breaks off mid-stream as httpx2's own error.
+        (
+            broken_reply(httpx2.RemoteProtocolError("peer closed connection")),
+            "the reply broke off (RemoteProtocolError: peer closed connection)",
+        ),
+        (
+            broken_reply(httpx2.ReadTimeout("The read operation timed out")),
+            "the reply broke off (ReadTimeout: The read operation timed out)",
+        ),
+    ],
+    ids=["overloaded", "connection dropped", "read timeout"],
+)
+def test_a_revision_that_fails_keeps_the_checked_answer(store, failure, detail):
     claim = "Qdrant was founded in 2021."
     api = ScriptedAPI(
         sse_reply("msg_1", [text(f"Qdrant uses HNSW. {claim}")]),
         check_reply("partly_supported", (claim,), "Cite a source for the date."),
-        api_error(529, "overloaded_error", "Overloaded"),
+        failure,
     )
     client = api.client()
     answer = ClaudeAgent(client, Retriever(store), OFFLINE, SelfChecker(client)).answer("q")
 
-    # An overloaded API costs the revision, not the answer that was already checked.
+    # A failed request costs the revision, not the answer that was already checked.
     assert answer.text == f"Qdrant uses HNSW. {claim}"
     assert answer.check == CheckResult("partly_supported", [claim], "Cite a source for the date.")
-    assert answer.steps[-1] == Step("revision", "error", "overloaded_error: Overloaded")
+    assert answer.steps[-1] == Step("revision", "error", detail)
 
 
 @pytest.mark.parametrize(
@@ -587,8 +627,13 @@ def test_a_revision_the_api_rejects_keeps_the_checked_answer(store):
             api_error(529, "overloaded_error", "Overloaded"),
             "The request to claude-haiku-5-6 failed: overloaded_error: Overloaded",
         ),
+        (
+            broken_reply(httpx2.ReadError("connection reset")),
+            "The request to claude-haiku-5-6 failed: "
+            "the reply broke off (ReadError: connection reset)",
+        ),
     ],
-    ids=["unknown model", "overloaded"],
+    ids=["unknown model", "overloaded", "connection dropped"],
 )
 def test_a_check_that_fails_keeps_the_answer_and_says_why(store, error, feedback):
     api = ScriptedAPI(sse_reply("msg_1", [text("Qdrant uses HNSW.")]), error)

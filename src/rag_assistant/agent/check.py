@@ -16,9 +16,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
+import httpx2
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from rag_assistant.answering.claude import api_error_detail
+from rag_assistant.answering.claude import request_error_detail
 from rag_assistant.answering.types import Answer, CheckResult
 
 if TYPE_CHECKING:
@@ -124,9 +125,9 @@ class SelfChecker:
                 feedback=f"The model '{self.model}' doesn't exist or this API key can't use "
                 "it. Check RAG_AGENT_CHECK_MODEL.",
             )
-        except anthropic.APIError as e:  # overloaded, rate limited, timed out, ...
+        except (anthropic.APIError, httpx2.RequestError) as e:  # overloaded, cut off, ...
             return CheckResult(
-                "skipped", feedback=f"The request to {self.model} failed: {api_error_detail(e)}"
+                "skipped", feedback=f"The request to {self.model} failed: {request_error_detail(e)}"
             )
         return parse_check(response)
 

@@ -120,6 +120,7 @@ def ask(
 ) -> None:
     """Answer QUESTION from your documents, with citations."""
     import anthropic  # imported here, not at the top: it takes most of a second to load
+    import httpx2
 
     from rag_assistant.answering.claude import MissingCredentialsError
 
@@ -132,6 +133,11 @@ def ask(
         _fail(str(e))
     except anthropic.AnthropicError as e:
         _fail(_explain_api_error(e, settings.llm_model))
+    except httpx2.RequestError as e:  # the SDK passes on a stream that breaks off as it is
+        _fail(
+            f"The connection to the Anthropic API broke off before the answer finished "
+            f"({type(e).__name__}). Try again in a moment."
+        )
 
     _print_answer(answer, verbose)
 

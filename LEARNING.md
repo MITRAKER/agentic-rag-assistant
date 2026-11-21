@@ -352,7 +352,10 @@ in the order they're first cited.
   more than ten minutes to generate (above 21,333 tokens), because a
   connection that stays silent that long can be cut somewhere along the way.
   A stream sends events while the model works, so `RAG_LLM_MAX_TOKENS` can use
-  the model's full 128,000.
+  the model's full 128,000. One catch: if the connection breaks off in the
+  middle of a stream, the SDK passes on the HTTP library's own error
+  (`httpx2.RequestError`) rather than one of its API errors, so code that
+  streams has to catch both. The CLI does, and explains it in one line.
 * **Stop reasons** tell you why the model stopped: `end_turn` (finished
   normally), `max_tokens` (cut off), `model_context_window_exceeded` (cut off
   too: the input and the reply filled the model's context window, so raising
@@ -1024,10 +1027,10 @@ statement by statement.
   (`_CheckReply`), because "the API promises" is not a test. A reply that
   doesn't parse makes the check `skipped`, never a false "supported".
 * **A check that can't run says so.** When the checker's reply doesn't parse,
-  its request fails (the model is overloaded, say, or `RAG_AGENT_CHECK_MODEL`
-  names a model your key can't use) or the answer is unfinished, the check is
-  `skipped`: you still get the answer, with a note that it wasn't checked and
-  why.
+  its request fails (the model is overloaded, say, the connection breaks off,
+  or `RAG_AGENT_CHECK_MODEL` names a model your key can't use) or the answer
+  is unfinished, the check is `skipped`: you still get the answer, with a note
+  that it wasn't checked and why.
 * **An honest "I don't know" passes.** `no_answer` counts as a pass: an answer
   that says the documents don't cover the question claims nothing unsupported.
 * **Revision.** When the check fails, a new message on the agent's thread
@@ -1036,8 +1039,9 @@ statement by statement.
   still fails after `RAG_AGENT_RETRIES` revisions, you get it with a warning
   listing the unsupported statements, instead of a confident-sounding answer.
   A revision that doesn't finish (it runs out of turns, is cut off, is
-  refused, or its request fails because the API is overloaded) is dropped:
-  you get the answer that was checked, and its warning.
+  refused, or its request fails because the API is overloaded or the
+  connection breaks off) is dropped: you get the answer that was checked, and
+  its warning.
 
 This is the idea behind research systems like Self-RAG and Corrective RAG:
 generate, critique, retrieve again. An LLM judge can be wrong too, so step 5

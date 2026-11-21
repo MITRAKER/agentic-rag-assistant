@@ -11,7 +11,7 @@ fails here rather than in production.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import anthropic
@@ -120,6 +120,7 @@ def sse_reply(
     blocks: list[dict[str, Any]],
     stop_reason: str = "end_turn",
     model: str = "claude-opus-5-5",
+    iterations: list[dict[str, Any]] | None = None,
 ) -> str:
     """One streamed reply holding `blocks`, in the event format the API uses."""
     start = {
@@ -135,11 +136,14 @@ def sse_reply(
     events: list[dict[str, Any]] = [{"type": "message_start", "message": start}]
     for index, block in enumerate(blocks):
         events.extend(_block_events(index, block))
+    usage: dict[str, Any] = {"output_tokens": 50}
+    if iterations is not None:  # who served the reply, e.g. [iteration("fallback_message", m)]
+        usage["iterations"] = iterations
     events.append(
         {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": 50},
+            "usage": usage,
         }
     )
     events.append({"type": "message_stop"})
@@ -169,6 +173,25 @@ def api_error(status: int, kind: str, message: str) -> httpx2.Response:
     """An error reply as the API sends it, e.g. api_error(529, "overloaded_error", "Overloaded")."""
     body = {"type": "error", "error": {"type": kind, "message": message}}
     return httpx2.Response(status, json=body)
+
+
+class _BrokenBody(httpx2.SyncByteStream):
+    """A response body that sends `start`, then fails the way a dropped connection does."""
+
+    def __init__(self, start: str, error: Exception) -> None:
+        self.start, self.error = start, error
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self.start.encode()
+        raise self.error
+
+
+def broken_reply(error: Exception) -> httpx2.Response:
+    """A reply that starts (HTTP 200, message_start) and then breaks off with `error`."""
+    start = sse_reply("msg_broken", []).split("event: message_delta")[0]
+    return httpx2.Response(
+        200, headers={"content-type": "text/event-stream"}, stream=_BrokenBody(start, error)
+    )
 
 
 def tool_call(name: str, tool_input: dict[str, Any], call_id: str = "toolu_1") -> dict[str, Any]:

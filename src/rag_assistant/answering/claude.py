@@ -22,6 +22,7 @@ from rag_assistant.answering.types import Answer, Citation, Segment, Source
 from rag_assistant.text import split_sentences
 
 if TYPE_CHECKING:
+    import httpx2
     from anthropic import Anthropic, APIError
     from anthropic.types.beta import BetaMessage, BetaSearchResultBlockParam
 
@@ -88,6 +89,19 @@ def api_error_detail(error: APIError) -> str:
         return f"{detail.get('type', 'error')}: {detail['message']}"
     status = getattr(error, "status_code", None)
     return f"{error.message} (HTTP {status})" if status else error.message
+
+
+def request_error_detail(error: APIError | httpx2.RequestError) -> str:
+    """What went wrong with a request to the API, in one line.
+
+    The SDK raises an APIError when a request fails, but a connection that breaks
+    off in the middle of a streamed reply reaches us as httpx2's own RequestError.
+    """
+    from anthropic import APIError
+
+    if isinstance(error, APIError):
+        return api_error_detail(error)
+    return f"the reply broke off ({type(error).__name__}: {error})"
 
 
 def search_result_block(src: Source, source: str | None = None) -> BetaSearchResultBlockParam:

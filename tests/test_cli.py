@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import anthropic
+import httpx2
 import pytest
 from typer.testing import CliRunner
 
@@ -124,6 +125,10 @@ OVERLOADED = {"type": "error", "error": {"type": "overloaded_error", "message": 
         (status_error(anthropic.InternalServerError, 500), "Anthropic API error: boom (HTTP 500)"),
         (status_error(anthropic.APIStatusError, 200, OVERLOADED), "overloaded_error: Overloaded"),
         (anthropic.AnthropicError("odd"), "Anthropic SDK error: odd"),
+        (
+            httpx2.RemoteProtocolError("peer closed connection"),
+            "broke off before the answer finished (RemoteProtocolError)",
+        ),
     ],
 )
 def test_ask_explains_api_errors(offline_env, monkeypatch, error, message):
