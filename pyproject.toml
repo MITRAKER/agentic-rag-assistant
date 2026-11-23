@@ -24,7 +24,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "anthropic>=2.10.0",
+    "anthropic>=2.11.0",
     "beautifulsoup4>=4.15.0",
     "fastembed>=0.9.1",  # 0.5 has the cross-encoder rerankers
     "httpx2>=2.16.2",  # HTTP client for the PyPI tool; the same one the anthropic SDK uses
@@ -46,7 +46,7 @@ dev = [
     "pre-commit-hooks==6.0.0",
     "pytest==9.2.0",
     "pytest-cov==7.1.0",
-    "ruff==0.17.5",
+    "ruff==0.17.6",
 ]
 
 [project.urls]
